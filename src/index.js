@@ -1,4 +1,4 @@
-import { tgSend, tgEditMessage, tgAnswerCallback, tgGetFileUrl } from "./telegram.js";
+import { tgSend, tgEditMessage, tgAnswerCallback, tgGetFileUrl, escapeHtml } from "./telegram.js";
 import { generateMetadata } from "./ai.js";
 import { uploadShort } from "./youtube.js";
 
@@ -131,9 +131,37 @@ async function handleMessage(message, env) {
     if (queue.length === 0) {
       await tgSend(env, chatId, "📋 Queue is empty.");
     } else {
-      const list = queue.map((q, i) => `${i + 1}. ${q.title}`).join("\n");
-      await tgSend(env, chatId, `📋 ${queue.length} video(s) queued:\n${list}`);
+      const list = queue.map((q, i) => `${i + 1}. ${escapeHtml(q.title)}`).join("\n");
+      await tgSend(env, chatId, `📋 ${queue.length} video(s) queued:\n${list}\n\nTo remove one, send: /remove (position number)\nTo clear everything: /clearqueue`);
     }
+    return;
+  }
+
+  if (message.text?.startsWith("/remove")) {
+    const parts = message.text.trim().split(/\s+/);
+    const index = parseInt(parts[1], 10) - 1;
+    const queue = await getQueue(env);
+
+    if (isNaN(index) || index < 0 || index >= queue.length) {
+      await tgSend(env, chatId, `⚠️ Give a valid number. Send /queue to see positions.`);
+      return;
+    }
+
+    const [removed] = queue.splice(index, 1);
+    await env.STATE.delete(removed.videoKey);
+    await saveQueue(env, queue);
+
+    await tgSend(env, chatId, `🗑️ Removed "${escapeHtml(removed.title)}" from the queue. ${queue.length} left.`);
+    return;
+  }
+
+  if (message.text === "/clearqueue") {
+    const queue = await getQueue(env);
+    for (const item of queue) {
+      await env.STATE.delete(item.videoKey);
+    }
+    await saveQueue(env, []);
+    await tgSend(env, chatId, "🗑️ Queue cleared completely.");
     return;
   }
 
@@ -152,7 +180,7 @@ async function handleMessage(message, env) {
     await env.STATE.put(`pending:${chatId}`, JSON.stringify({ step: "awaiting_confirmation" }));
 
     const hashtags = meta.hashtags.map((h) => `#${h.replace(/^#/, "")}`).join(" ");
-    const preview = `<b>Title:</b> ${meta.title}\n\n<b>Description:</b>\n${meta.description}\n\n<b>Hashtags:</b> ${hashtags}`;
+    const preview = `<b>Title:</b> ${escapeHtml(meta.title)}\n\n<b>Description:</b>\n${escapeHtml(meta.description)}\n\n<b>Hashtags:</b> ${escapeHtml(hashtags)}`;
 
     // --- THE TWO BUTTONS ---
     await tgSend(env, chatId, preview, {

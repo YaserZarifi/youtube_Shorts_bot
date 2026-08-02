@@ -31,11 +31,13 @@ Generate:
 - Sound natural, not clickbait or spam.
 - Match the video's mood.
 
+
 2. description
 - Write 2-3 engaging Persian sentences.
 - Encourage viewers to like, comment, and subscribe naturally.
 - Include relevant keywords for YouTube search.
 - Do not use excessive emojis (maximum 1).
+- if the "userText" contains #شعر hashtag, make sure to include the exact "usertext" in top of the description!
 
 3. hashtags
 - Return 5-8 highly relevant hashtags.
@@ -57,11 +59,12 @@ Use exactly this schema:
 
   const result = await env.AI.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
     messages: [{ role: "user", content: prompt }],
+    max_tokens: 1024,
   });
 
   console.log("Raw AI result:", JSON.stringify(result));
+  console.log("userText received:", JSON.stringify(userText));
 
-  // Response shape can vary by model — handle string, object-with-response, or array-of-choices shapes
   let rawText;
   if (typeof result === "string") {
     rawText = result;
@@ -75,16 +78,24 @@ Use exactly this schema:
     rawText = JSON.stringify(result?.response ?? result);
   }
 
-  const cleaned = rawText.trim().replace(/^```json/, "").replace(/```$/, "").trim();
+  console.log("Extracted rawText:", rawText);
 
+  // Pull out just the {...} block in case the model added extra text around it
+  const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+  const cleaned = jsonMatch ? jsonMatch[0] : rawText.trim();
+
+  let parsed = null;
   try {
-    const parsed = JSON.parse(cleaned);
-    return {
-      title: (parsed.title || userText).slice(0, 100),
-      description: parsed.description || "",
-      hashtags: Array.isArray(parsed.hashtags) ? parsed.hashtags : [],
-    };
-  } catch {
-    return { title: userText.slice(0, 90), description: "", hashtags: [] };
+    parsed = JSON.parse(cleaned);
+  } catch (err) {
+    console.error("JSON parse failed:", err.message, "cleaned was:", cleaned);
   }
+
+  const fallbackTitle = (userText || "Untitled").slice(0, 90);
+
+  return {
+    title: (parsed?.title && parsed.title.trim()) ? parsed.title.slice(0, 100) : fallbackTitle,
+    description: parsed?.description?.trim() || "",
+    hashtags: Array.isArray(parsed?.hashtags) && parsed.hashtags.length > 0 ? parsed.hashtags : [],
+  };
 }

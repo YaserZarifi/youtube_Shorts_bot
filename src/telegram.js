@@ -1,13 +1,25 @@
 const TG_API = (token) => `https://api.telegram.org/bot${token}`;
 
+export function escapeHtml(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 export async function tgSend(env, chatId, text, replyMarkup) {
   const body = { chat_id: chatId, text, parse_mode: "HTML" };
   if (replyMarkup) body.reply_markup = replyMarkup;
-  await fetch(`${TG_API(env.TELEGRAM_BOT_TOKEN)}/sendMessage`, {
+  const res = await fetch(`${TG_API(env.TELEGRAM_BOT_TOKEN)}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  const data = await res.json();
+  if (!data.ok) {
+    console.error("tgSend failed:", JSON.stringify(data), "for text:", text);
+  }
+  return data;
 }
 
 export async function tgEditMessage(env, chatId, messageId, text) {
