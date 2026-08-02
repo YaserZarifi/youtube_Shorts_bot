@@ -1,6 +1,6 @@
 import { tgSend, tgEditMessage, tgAnswerCallback, tgGetFileUrl, escapeHtml } from "./telegram.js";
 import { generateMetadata } from "./ai.js";
-import { uploadShort, getVideoStats } from "./youtube.js";
+import { uploadShort, getVideoStats, getAccessToken } from "./youtube.js";
 
 const MAX_BYTES = 20 * 1024 * 1024; // Telegram bot download cap
 
@@ -123,6 +123,34 @@ async function fetchWithRetry(url, retries = 2) {
   throw lastErr;
 }
 
+async function sendWeeklyDigest(env) {
+  const notifyId = (env.MY_TELEGRAM_USER_ID || "").split(",")[0].trim();
+  if (!notifyId) return;
+
+  const postedRaw = await env.STATE.get("postedVideos");
+  const posted = postedRaw ? JSON.parse(postedRaw) : [];
+  const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const recentWeek = posted.filter((p) => p.uploadedAt >= weekAgo);
+
+  if (recentWeek.length === 0) {
+    await tgSend(env, notifyId, "📊 <b>Weekly Digest</b>\n\nNo videos posted this week.");
+    return;
+  }
+
+  const stats = await getVideoStats(env, recentWeek.map((p) => p.id));
+  const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+  let totalViews = 0;
+  const list = recentWeek
+    .map((p, i) => {
+      const views = parseInt(stats[p.id]?.viewCount ?? "0", 10);
+      totalViews += views;
+      return `${i + 1}. ${escapeHtml(p.title)}\n   👁️ ${views} views · 🕒 ${formatReadable(p.uploadedAt, timeZone)}`;
+    })
+    .join("\n\n");
+
+  await tgSend(env, notifyId, `📊 <b>Weekly Digest</b>\n\n${recentWeek.length} video(s) posted this week · ${totalViews} total views\n\n${list}`);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -144,7 +172,11 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(processQueueTick(env));
+    if (event.cron === "0 9 * * 5") {
+      ctx.waitUntil(sendWeeklyDigest(env));
+    } else {
+      ctx.waitUntil(processQueueTick(env));
+    }
   },
 };
 
@@ -311,6 +343,8 @@ Just send a video (under 20MB). I'll ask what it's about, generate a Persian tit
 /remove (position) — delete one video from the queue (e.g. /remove 1)
 /clearqueue — wipe the entire queue
 /resumequeue — resume the queue after it's been auto-paused (e.g. YouTube quota exceeded)
+/status — quick health check (queue, quota, last upload, YouTube token)
+/preview (position) — see full title/description/hashtags for a queued video, with edit buttons
 
 <b>History:</b>
 /posted — see the last 10 videos actually posted to YouTube, with live view counts
@@ -497,6 +531,86 @@ This bot only responds to your authorized Telegram accounts.
     return;
   }
 
+  if (message.text === "/status") {
+    const paused = await env.STATE.get("queuePaused");
+    const queue = await getQueue(env);
+    const today = new Date().toISOString().slice(0, 10);
+    const countKey = `ytcount:${today}`;
+    const count = parseInt((await env.STATE.get(countKey)) || "0", 10);
+    const maxPerDay = parseInt(env.MAX_UPLOADS_PER_DAY || "3", 10);
+    const lastUploadAt = parseInt((await env.STATE.get("lastUploadAt")) || "0", 10);
+    const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+
+    let tokenStatus = "✅ OK";
+    try {
+      await getAccessToken(env);
+    } catch (err) {
+      tokenStatus = `❌ ${err.message}`;
+    }
+
+    const statusText = `📊 <b>Bot Status</b>
+
+📋 Queue: ${queue.length} video(s)
+📅 Today's uploads: ${count}/${maxPerDay}
+🕒 Last upload: ${lastUploadAt ? formatReadable(lastUploadAt, timeZone) : "never"}
+⏸️ Paused: ${paused ? `yes (${paused})` : "no"}
+🔑 YouTube token: ${tokenStatus}`;
+
+    await tgSend(env, chatId, statusText);
+    return;
+  }
+
+  if (message.text?.startsWith("/preview")) {
+    const parts = message.text.trim().split(/\s+/);
+    const index = parseInt(parts[1], 10) - 1;
+    const queue = await getQueue(env);
+
+    if (isNaN(index) || index < 0 || index >= queue.length) {
+      await tgSend(env, chatId, "⚠️ Give a valid queue position. Send /queue to see positions.");
+      return;
+    }
+
+    const item = queue[index];
+    const hashtagsText = (item.hashtags || []).map((h) => `#${h.replace(/^#/, "")}`).join(" ");
+    const preview = `<b>Title:</b> ${escapeHtml(item.title)}\n\n<b>Description:</b>\n${escapeHtml(item.description || "(none)")}\n\n<b>Hashtags:</b> ${escapeHtml(hashtagsText || "(none)")}`;
+
+    await tgSend(env, chatId, preview, {
+      inline_keyboard: [
+        [
+          { text: "✏️ Edit Title", callback_data: `et:${item.id}` },
+          { text: "✏️ Edit Description", callback_data: `ed:${item.id}` },
+          { text: "✏️ Edit Hashtags", callback_data: `eh:${item.id}` },
+        ],
+      ],
+    });
+    return;
+  }
+
+  if (message.text) {
+    const editPendingRaw = await env.STATE.get(`editpending:${chatId}`);
+    if (editPendingRaw) {
+      const { itemId, field } = JSON.parse(editPendingRaw);
+      const queue = await getQueue(env);
+      const item = queue.find((q) => q.id === itemId);
+      await env.STATE.delete(`editpending:${chatId}`);
+
+      if (!item) {
+        await tgSend(env, chatId, "⚠️ That queued item no longer exists, nothing was changed.");
+        return;
+      }
+
+      if (field === "hashtags") {
+        item.hashtags = message.text.split(",").map((h) => h.trim().replace(/^#/, "")).filter(Boolean);
+      } else {
+        item[field] = message.text.trim();
+      }
+
+      await saveQueue(env, queue);
+      await tgSend(env, chatId, `✅ Updated ${field} for "${escapeHtml(item.title)}".`);
+      return;
+    }
+  }
+
   if (message.text) {
     const pendingRaw = await env.STATE.get(`pending:${chatId}`);
     if (!pendingRaw) {
@@ -582,6 +696,32 @@ async function handleCallback(cq, env) {
   const chatId = cq.message.chat.id;
   const userId = cq.from.id.toString();
   if (!isAuthorized(env, userId)) return;
+
+  if (cq.data.startsWith("et:") || cq.data.startsWith("ed:") || cq.data.startsWith("eh:")) {
+    const [prefix, itemId] = cq.data.split(":");
+    const fieldMap = { et: "title", ed: "description", eh: "hashtags" };
+    const field = fieldMap[prefix];
+
+    await tgAnswerCallback(env, cq.id, "Reply with the new value");
+
+    const queue = await getQueue(env);
+    const item = queue.find((q) => q.id === itemId);
+    if (!item) {
+      await tgSend(env, chatId, "⚠️ That queued item no longer exists.");
+      return;
+    }
+
+    await env.STATE.put(`editpending:${chatId}`, JSON.stringify({ itemId, field }), { expirationTtl: 60 * 30 });
+
+    const fieldLabel = { title: "Title", description: "Description", hashtags: "Hashtags (comma-separated, no # needed)" }[field];
+    const currentValue = field === "hashtags" ? (item.hashtags || []).join(", ") : (item[field] || "(none)");
+
+    await tgSend(env, chatId, `Current ${fieldLabel}:\n${escapeHtml(currentValue)}\n\nReply with the new value:`, {
+      force_reply: true,
+      selective: true,
+    });
+    return;
+  }
 
   await tgAnswerCallback(env, cq.id, "Added to queue");
 
