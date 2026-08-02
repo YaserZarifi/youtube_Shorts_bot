@@ -1,5 +1,9 @@
 # Reels → YouTube Shorts Bot
 
+[![Repo](https://img.shields.io/badge/github-YaserZarifi%2Fyoutube__Shorts__bot-181717?logo=github)](https://github.com/YaserZarifi/youtube_Shorts_bot)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![Runtime](https://img.shields.io/badge/runtime-Cloudflare%20Workers-f38020?logo=cloudflare)](https://workers.cloudflare.com/)
+
 A private Telegram bot that turns short video clips into scheduled, AI-captioned YouTube Shorts uploads — built as a [Cloudflare Worker](https://workers.cloudflare.com/), with no server to manage.
 
 Send a video to the bot, tell it what it's about, and it writes a Persian title/description/hashtags with AI, queues the video, and posts it to YouTube on a controlled schedule — spaced out, capped per day, and restricted to a preferred posting window.
@@ -92,8 +96,8 @@ YouTube Shorts (uploaded via YouTube Data API v3)
 ### 1. Clone and install
 
 ```bash
-git clone <your-repo-url>
-cd <repo-folder>
+git clone https://github.com/YaserZarifi/youtube_Shorts_bot.git
+cd youtube_Shorts_bot
 ```
 
 This project has no external npm dependencies — it runs on the Workers runtime directly.
@@ -112,7 +116,7 @@ Copy the returned `id` into `wrangler.jsonc` under the `kv_namespaces` binding f
 {
   "name": "reels-to-youtube-bot",
   "main": "index.js",
-  "compatibility_date": "2024-09-23",
+  "compatibility_date": "2026-08-01",
   "kv_namespaces": [
     { "binding": "STATE", "id": "<your-kv-namespace-id>" }
   ],
@@ -191,4 +195,4 @@ Message your bot `/help` — if it responds, you're live. Send a short video to 
 
 ## 📄 License
 
-Add your preferred license here (e.g. MIT).
+Released under the [MIT License](./LICENSE).
