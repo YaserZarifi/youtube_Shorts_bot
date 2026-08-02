@@ -66,7 +66,7 @@ function parseLocalDateTime(dateStr, timeStr, timeZone) {
 async function computeScheduleTimes(env, queueItems) {
   const timeZone = env.DISPLAY_TIMEZONE || "UTC";
   const maxPerDay = parseInt(env.MAX_UPLOADS_PER_DAY || "3", 10);
-  const gapHours = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "5");
+  const gapHours = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "6");
   const gapMs = gapHours * 60 * 60 * 1000;
 
   const now = Date.now();
@@ -104,6 +104,25 @@ async function computeScheduleTimes(env, queueItems) {
   return times;
 }
 
+function isQuotaError(message) {
+  return /quota|dailyLimitExceeded|uploadLimitExceeded/i.test(message || "");
+}
+
+async function fetchWithRetry(url, retries = 2) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -130,6 +149,12 @@ export default {
 };
 
 async function processQueueTick(env) {
+  const paused = await env.STATE.get("queuePaused");
+  if (paused) {
+    console.log("Queue is paused:", paused);
+    return;
+  }
+
   const maxPerDay = parseInt(env.MAX_UPLOADS_PER_DAY || "3", 10);
   const minHoursGap = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "6");
 
@@ -190,7 +215,35 @@ async function processQueueTick(env) {
     await tgSend(env, item.chatId, `✅ Queued video is live: https://youtu.be/${videoId}\n📋 ${queue.length} left in queue.`);
   } catch (err) {
     console.error("Queued upload failed:", err.message);
-    await tgSend(env, item.chatId, `❌ Scheduled upload failed for "${item.title}": ${err.message}`);
+
+    if (isQuotaError(err.message)) {
+      await env.STATE.put("queuePaused", "YouTube daily quota exceeded", { expirationTtl: 60 * 60 * 26 });
+      await tgSend(
+        env,
+        item.chatId,
+        `🚫 YouTube upload quota exceeded. The queue is now PAUSED so it doesn't keep failing.\n\nSend /resumequeue once your quota has reset (usually resets around midnight Pacific Time) or once you've fixed the issue.`
+      );
+      return;
+    }
+
+    item.failCount = (item.failCount || 0) + 1;
+    if (item.failCount >= 2) {
+      queue.shift();
+      queue.push(item);
+      await saveQueue(env, queue);
+      await tgSend(
+        env,
+        item.chatId,
+        `❌ Upload failed twice for "${item.title}": ${err.message}\n↩️ Moved to the back of the queue (position ${queue.length}) so it doesn't block other videos. I'll retry it again later.`
+      );
+    } else {
+      await saveQueue(env, queue);
+      await tgSend(
+        env,
+        item.chatId,
+        `❌ Scheduled upload failed for "${item.title}" (attempt ${item.failCount}/2): ${err.message}\nWill retry next cycle.`
+      );
+    }
   }
 }
 
@@ -217,7 +270,14 @@ async function handleMessage(message, env) {
     }
 
     const fileUrl = await tgGetFileUrl(env, media.file_id);
-    const fileRes = await fetch(fileUrl);
+    let fileRes;
+    try {
+      fileRes = await fetchWithRetry(fileUrl, 2);
+    } catch (err) {
+      console.error("Video download failed after retries:", err.message);
+      await tgSend(env, chatId, "⚠️ Couldn't download that video from Telegram after a few tries. Please resend it.");
+      return;
+    }
     const videoBytes = await fileRes.arrayBuffer();
 
     const videoKey = `videofile:${chatId}:${media.file_unique_id}`;
@@ -240,12 +300,13 @@ Just send a video (under 20MB). I'll ask what it's about, generate a Persian tit
 /setschedule (position) YYYY-MM-DD HH:MM — set a custom date/time for a queued video (e.g. /setschedule 2 2026-08-05 18:30). If it's too close to another upload, I'll adjust it to respect the minimum gap and tell you the real time.
 /remove (position) — delete one video from the queue (e.g. /remove 1)
 /clearqueue — wipe the entire queue
+/resumequeue — resume the queue after it's been auto-paused (e.g. YouTube quota exceeded)
 
 <b>History:</b>
 /posted — see the last 10 videos actually posted to YouTube, with live view counts
 
 <b>How scheduling works:</b>
-Videos auto-post at most ${env.MAX_UPLOADS_PER_DAY || "3"} per day, at least ${env.MIN_HOURS_BETWEEN_UPLOADS || "5"} hours apart, checked every hour. This spacing helps avoid your own Shorts competing with each other on the same day.
+Videos auto-post at most ${env.MAX_UPLOADS_PER_DAY || "3"} per day, at least ${env.MIN_HOURS_BETWEEN_UPLOADS || "6"} hours apart, checked every hour. This spacing helps avoid your own Shorts competing with each other on the same day.
 
 <b>Access:</b>
 This bot only responds to your authorized Telegram accounts.
@@ -257,9 +318,11 @@ This bot only responds to your authorized Telegram accounts.
   }
 
   if (message.text === "/queue") {
+    const paused = await env.STATE.get("queuePaused");
+    const pausedNote = paused ? `⏸️ Queue is currently PAUSED (${paused}). Send /resumequeue to continue.\n\n` : "";
     const queue = await getQueue(env);
     if (queue.length === 0) {
-      await tgSend(env, chatId, "📋 Queue is empty.");
+      await tgSend(env, chatId, `${pausedNote}📋 Queue is empty.`);
     } else {
       const timeZone = env.DISPLAY_TIMEZONE || "UTC";
       const scheduleTimes = await computeScheduleTimes(env, queue);
@@ -269,7 +332,7 @@ This bot only responds to your authorized Telegram accounts.
       await tgSend(
         env,
         chatId,
-        `📋 ${queue.length} video(s) queued:\n\n${list}\n\nTo remove one, send: /remove (position number)\nTo clear everything: /clearqueue`
+        `${pausedNote}📋 ${queue.length} video(s) queued:\n\n${list}\n\nTo remove one, send: /remove (position number)\nTo clear everything: /clearqueue`
       );
     }
     return;
@@ -307,7 +370,7 @@ This bot only responds to your authorized Telegram accounts.
 
     const scheduleTimes = await computeScheduleTimes(env, queue);
     const actualTime = scheduleTimes[index];
-    const gapHours = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "5");
+    const gapHours = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "6");
     const adjustedNote =
       Math.abs(actualTime - targetMs) > 60000
         ? `\n\n⚠️ Adjusted to keep the ${gapHours}h minimum gap — it'll actually go out at ${formatReadable(actualTime, timeZone)}.`
@@ -415,6 +478,12 @@ This bot only responds to your authorized Telegram accounts.
     }
     await saveQueue(env, []);
     await tgSend(env, chatId, "🗑️ Queue cleared completely.");
+    return;
+  }
+
+  if (message.text === "/resumequeue") {
+    await env.STATE.delete("queuePaused");
+    await tgSend(env, chatId, "▶️ Queue resumed. It'll try uploading again on the next hourly check.");
     return;
   }
 

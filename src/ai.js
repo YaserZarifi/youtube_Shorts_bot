@@ -176,9 +176,13 @@ Use exactly this schema:
 
   const fallbackTitle = (userText || "Untitled").slice(0, 90);
 
+  const staticTags = ["shorts", "youtubeshorts", "شعر", "موسیقی"];
+  const aiTags = Array.isArray(parsed?.hashtags) ? parsed.hashtags.map((t) => String(t).replace(/^#/, "")) : [];
+  const hashtags = [...new Set([...staticTags, ...aiTags])];
+
   return {
     title: (parsed?.title && parsed.title.trim()) ? parsed.title.slice(0, 100) : fallbackTitle,
     description: parsed?.description?.trim() || "",
-    hashtags: Array.isArray(parsed?.hashtags) && parsed.hashtags.length > 0 ? parsed.hashtags : [],
+    hashtags,
   };
 }
