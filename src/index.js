@@ -63,11 +63,36 @@ function parseLocalDateTime(dateStr, timeStr, timeZone) {
   return guess;
 }
 
+function getLocalHour(ms, timeZone) {
+  const dtf = new Intl.DateTimeFormat("en-US", { timeZone, hour12: false, hour: "2-digit" });
+  const hour = parseInt(dtf.format(new Date(ms)), 10);
+  return hour === 24 ? 0 : hour;
+}
+
+function isWithinPostingWindow(ms, timeZone, startHour, endHour) {
+  if (startHour === endHour) return true; // window disabled (full day allowed)
+  const h = getLocalHour(ms, timeZone);
+  if (startHour < endHour) {
+    return h >= startHour && h < endHour;
+  }
+  // window wraps past midnight (e.g. 13 -> 1)
+  return h >= startHour || h < endHour;
+}
+
+function nextWindowStart(ms, timeZone, startHour) {
+  const dateStr = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
+  let candidate = parseLocalDateTime(dateStr, `${String(startHour).padStart(2, "0")}:00`, timeZone);
+  if (candidate <= ms) candidate += 24 * 60 * 60 * 1000;
+  return candidate;
+}
+
 async function computeScheduleTimes(env, queueItems) {
   const timeZone = env.DISPLAY_TIMEZONE || "UTC";
   const maxPerDay = parseInt(env.MAX_UPLOADS_PER_DAY || "3", 10);
   const gapHours = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "6");
   const gapMs = gapHours * 60 * 60 * 1000;
+  const windowStartHour = parseInt(env.POSTING_WINDOW_START_HOUR ?? "13", 10);
+  const windowEndHour = parseInt(env.POSTING_WINDOW_END_HOUR ?? "1", 10);
 
   const now = Date.now();
   const today = new Date().toISOString().slice(0, 10);
@@ -83,6 +108,10 @@ async function computeScheduleTimes(env, queueItems) {
   const times = [];
   for (const item of queueItems) {
     let candidate = item.manualScheduledAt ? Math.max(item.manualScheduledAt, cursor) : cursor;
+
+    if (!item.manualScheduledAt && !isWithinPostingWindow(candidate, timeZone, windowStartHour, windowEndHour)) {
+      candidate = nextWindowStart(candidate, timeZone, windowStartHour);
+    }
 
     let candidateDayKey = dateKey(candidate, timeZone);
     if (candidateDayKey !== currentDayKey) {
@@ -228,6 +257,16 @@ async function processQueueTick(env) {
     return;
   }
 
+  if (!item.manualScheduledAt) {
+    const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+    const windowStartHour = parseInt(env.POSTING_WINDOW_START_HOUR ?? "13", 10);
+    const windowEndHour = parseInt(env.POSTING_WINDOW_END_HOUR ?? "1", 10);
+    if (!isWithinPostingWindow(Date.now(), timeZone, windowStartHour, windowEndHour)) {
+      console.log("Outside posting window, skipping this tick.");
+      return;
+    }
+  }
+
   const videoBytes = await env.STATE.get(item.videoKey, "arrayBuffer");
   if (!videoBytes) {
     console.error("Queued video missing from storage, dropping item:", item.id);
@@ -350,7 +389,7 @@ Just send a video (under 20MB). I'll ask what it's about, generate a Persian tit
 /posted — see the last 10 videos actually posted to YouTube, with live view counts
 
 <b>How scheduling works:</b>
-Videos auto-post at most ${env.MAX_UPLOADS_PER_DAY || "3"} per day, at least ${env.MIN_HOURS_BETWEEN_UPLOADS || "6"} hours apart, checked every hour. This spacing helps avoid your own Shorts competing with each other on the same day.
+Videos auto-post at most ${env.MAX_UPLOADS_PER_DAY || "3"} per day, at least ${env.MIN_HOURS_BETWEEN_UPLOADS || "6"} hours apart, checked every hour, and only between ${env.POSTING_WINDOW_START_HOUR || "13"}:00–${env.POSTING_WINDOW_END_HOUR || "1"}:00 (Kabul time). This spacing helps avoid your own Shorts competing with each other on the same day, and keeps posts within your target hours.
 
 <b>Access:</b>
 This bot only responds to your authorized Telegram accounts.
