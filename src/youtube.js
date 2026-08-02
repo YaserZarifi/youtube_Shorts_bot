@@ -45,3 +45,18 @@ export async function uploadShort(env, videoBytes, { title, description, tags })
   if (!data.id) throw new Error("YouTube upload failed: " + JSON.stringify(data));
   return data.id;
 }
+
+export async function getVideoStats(env, videoIds) {
+  if (videoIds.length === 0) return {};
+  const accessToken = await getAccessToken(env);
+  const res = await fetch(
+    `https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${videoIds.join(",")}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  const data = await res.json();
+  const map = {};
+  for (const item of data.items || []) {
+    map[item.id] = item.statistics;
+  }
+  return map;
+}

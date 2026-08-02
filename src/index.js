@@ -1,6 +1,6 @@
 import { tgSend, tgEditMessage, tgAnswerCallback, tgGetFileUrl, escapeHtml } from "./telegram.js";
 import { generateMetadata } from "./ai.js";
-import { uploadShort } from "./youtube.js";
+import { uploadShort, getVideoStats } from "./youtube.js";
 
 const MAX_BYTES = 20 * 1024 * 1024; // Telegram bot download cap
 
@@ -29,10 +29,36 @@ function formatReadable(ms, timeZone) {
   }).format(new Date(ms));
 }
 
-async function computeScheduleTimes(env, queueLength) {
+function getTimeZoneOffsetMs(timeZone, ms) {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone, hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  const parts = dtf.formatToParts(new Date(ms));
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  const hour = map.hour === "24" ? "0" : map.hour;
+  const asUTC = Date.UTC(map.year, map.month - 1, map.day, hour, map.minute, map.second);
+  return asUTC - ms;
+}
+
+function parseLocalDateTime(dateStr, timeStr, timeZone) {
+  const [y, mo, d] = (dateStr || "").split("-").map(Number);
+  const [h, mi] = (timeStr || "").split(":").map(Number);
+  if (!y || !mo || !d || isNaN(h) || isNaN(mi)) return null;
+  let guess = Date.UTC(y, mo - 1, d, h, mi);
+  for (let i = 0; i < 2; i++) {
+    const offset = getTimeZoneOffsetMs(timeZone, guess);
+    guess = Date.UTC(y, mo - 1, d, h, mi) - offset;
+  }
+  return guess;
+}
+
+async function computeScheduleTimes(env, queueItems) {
   const timeZone = env.DISPLAY_TIMEZONE || "UTC";
   const maxPerDay = parseInt(env.MAX_UPLOADS_PER_DAY || "3", 10);
-  const gapHours = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "6");
+  const gapHours = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "5");
   const gapMs = gapHours * 60 * 60 * 1000;
 
   const now = Date.now();
@@ -40,25 +66,32 @@ async function computeScheduleTimes(env, queueLength) {
   const usedTodayCount = parseInt((await env.STATE.get(`ytcount:${today}`)) || "0", 10);
   const lastUploadAt = parseInt((await env.STATE.get("lastUploadAt")) || "0", 10);
 
-  let nextTime = lastUploadAt ? lastUploadAt + gapMs : now;
-  if (nextTime < now) nextTime = now;
+  let cursor = lastUploadAt ? lastUploadAt + gapMs : now;
+  if (cursor < now) cursor = now;
 
   let usedToday = usedTodayCount;
-  let currentDayKey = dateKey(nextTime, timeZone);
+  let currentDayKey = dateKey(cursor, timeZone);
 
   const times = [];
-  for (let i = 0; i < queueLength; i++) {
+  for (const item of queueItems) {
+    let candidate = item.manualScheduledAt ? Math.max(item.manualScheduledAt, cursor) : cursor;
+
+    let candidateDayKey = dateKey(candidate, timeZone);
+    if (candidateDayKey !== currentDayKey) {
+      usedToday = 0;
+      currentDayKey = candidateDayKey;
+    }
     while (usedToday >= maxPerDay) {
-      // push forward hour by hour until the calendar day (in target timezone) changes
       do {
-        nextTime += 60 * 60 * 1000;
-      } while (dateKey(nextTime, timeZone) === currentDayKey);
-      currentDayKey = dateKey(nextTime, timeZone);
+        candidate += 60 * 60 * 1000;
+      } while (dateKey(candidate, timeZone) === currentDayKey);
+      currentDayKey = dateKey(candidate, timeZone);
       usedToday = 0;
     }
-    times.push(nextTime);
+
+    times.push(candidate);
     usedToday++;
-    nextTime += gapMs;
+    cursor = candidate + gapMs;
   }
   return times;
 }
@@ -114,6 +147,12 @@ async function processQueueTick(env) {
   }
 
   const item = queue[0];
+
+  if (item.manualScheduledAt && Date.now() < item.manualScheduledAt) {
+    console.log("Next queued item has a future manual schedule, waiting.");
+    return;
+  }
+
   const videoBytes = await env.STATE.get(item.videoKey, "arrayBuffer");
   if (!videoBytes) {
     console.error("Queued video missing from storage, dropping item:", item.id);
@@ -134,6 +173,11 @@ async function processQueueTick(env) {
     await env.STATE.delete(item.videoKey);
     await env.STATE.put(countKey, (count + 1).toString(), { expirationTtl: 60 * 60 * 26 });
     await env.STATE.put("lastUploadAt", Date.now().toString());
+
+    const postedRaw = await env.STATE.get("postedVideos");
+    const posted = postedRaw ? JSON.parse(postedRaw) : [];
+    posted.unshift({ id: videoId, title: item.title, uploadedAt: Date.now() });
+    await env.STATE.put("postedVideos", JSON.stringify(posted.slice(0, 200)));
 
     await tgSend(env, item.chatId, `✅ Queued video is live: https://youtu.be/${videoId}\n📋 ${queue.length} left in queue.`);
   } catch (err) {
@@ -182,7 +226,7 @@ async function handleMessage(message, env) {
       await tgSend(env, chatId, "📋 Queue is empty.");
     } else {
       const timeZone = env.DISPLAY_TIMEZONE || "UTC";
-      const scheduleTimes = await computeScheduleTimes(env, queue.length);
+      const scheduleTimes = await computeScheduleTimes(env, queue);
       const list = queue
         .map((q, i) => `${i + 1}. ${escapeHtml(q.title)}\n   🕒 ${formatReadable(scheduleTimes[i], timeZone)}`)
         .join("\n\n");
@@ -191,6 +235,121 @@ async function handleMessage(message, env) {
         chatId,
         `📋 ${queue.length} video(s) queued:\n\n${list}\n\nTo remove one, send: /remove (position number)\nTo clear everything: /clearqueue`
       );
+    }
+    return;
+  }
+
+  if (message.text?.startsWith("/setschedule")) {
+    const parts = message.text.trim().split(/\s+/);
+    const index = parseInt(parts[1], 10) - 1;
+    const dateStr = parts[2];
+    const timeStr = parts[3];
+    const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+
+    const queue = await getQueue(env);
+    if (isNaN(index) || index < 0 || index >= queue.length) {
+      await tgSend(env, chatId, "⚠️ Give a valid queue position. Send /queue to see positions.");
+      return;
+    }
+    if (!dateStr || !timeStr) {
+      await tgSend(env, chatId, "⚠️ Usage: /setschedule (position) YYYY-MM-DD HH:MM\nExample: /setschedule 2 2026-08-05 18:30");
+      return;
+    }
+
+    const targetMs = parseLocalDateTime(dateStr, timeStr, timeZone);
+    if (!targetMs || isNaN(targetMs)) {
+      await tgSend(env, chatId, "⚠️ Couldn't parse that. Use format: YYYY-MM-DD HH:MM (24-hour)");
+      return;
+    }
+    if (targetMs < Date.now()) {
+      await tgSend(env, chatId, "⚠️ That time is in the past. Pick a future date/time.");
+      return;
+    }
+
+    queue[index].manualScheduledAt = targetMs;
+    await saveQueue(env, queue);
+
+    const scheduleTimes = await computeScheduleTimes(env, queue);
+    const actualTime = scheduleTimes[index];
+    const gapHours = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "5");
+    const adjustedNote =
+      Math.abs(actualTime - targetMs) > 60000
+        ? `\n\n⚠️ Adjusted to keep the ${gapHours}h minimum gap — it'll actually go out at ${formatReadable(actualTime, timeZone)}.`
+        : "";
+
+    await tgSend(
+      env,
+      chatId,
+      `🗓️ Requested time for "${escapeHtml(queue[index].title)}": ${formatReadable(targetMs, timeZone)}.${adjustedNote}\n\nSend /queue to see the full updated schedule.`
+    );
+    return;
+  }
+
+  if (message.text === "/posted") {
+    const postedRaw = await env.STATE.get("postedVideos");
+    const posted = postedRaw ? JSON.parse(postedRaw) : [];
+    if (posted.length === 0) {
+      await tgSend(env, chatId, "📭 No videos posted yet.");
+      return;
+    }
+    const recent = posted.slice(0, 10);
+    const stats = await getVideoStats(env, recent.map((p) => p.id));
+    const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+    const list = recent
+      .map((p, i) => {
+        const views = stats[p.id]?.viewCount ?? "?";
+        return `${i + 1}. ${escapeHtml(p.title)}\n   👁️ ${views} views · 🕒 ${formatReadable(p.uploadedAt, timeZone)}\n   🔗 https://youtu.be/${p.id}`;
+      })
+      .join("\n\n");
+    await tgSend(env, chatId, `📼 Last ${recent.length} posted video(s):\n\n${list}`);
+    return;
+  }
+
+  if (message.text?.startsWith("/postnow")) {
+    const parts = message.text.trim().split(/\s+/);
+    const index = parseInt(parts[1], 10) - 1;
+
+    const queue = await getQueue(env);
+    if (isNaN(index) || index < 0 || index >= queue.length) {
+      await tgSend(env, chatId, "⚠️ Give a valid queue position. Send /queue to see positions.");
+      return;
+    }
+
+    const item = queue[index];
+    const videoBytes = await env.STATE.get(item.videoKey, "arrayBuffer");
+    if (!videoBytes) {
+      await tgSend(env, chatId, "⚠️ That video's data is missing from storage, can't post it.");
+      return;
+    }
+
+    await tgSend(env, chatId, `⏫ Posting "${escapeHtml(item.title)}" now...`);
+
+    try {
+      const videoId = await uploadShort(env, videoBytes, {
+        title: item.title,
+        description: item.description,
+        tags: item.hashtags,
+      });
+
+      queue.splice(index, 1);
+      await saveQueue(env, queue);
+      await env.STATE.delete(item.videoKey);
+
+      const today = new Date().toISOString().slice(0, 10);
+      const countKey = `ytcount:${today}`;
+      const count = parseInt((await env.STATE.get(countKey)) || "0", 10);
+      await env.STATE.put(countKey, (count + 1).toString(), { expirationTtl: 60 * 60 * 26 });
+      await env.STATE.put("lastUploadAt", Date.now().toString());
+
+      const postedRaw = await env.STATE.get("postedVideos");
+      const posted = postedRaw ? JSON.parse(postedRaw) : [];
+      posted.unshift({ id: videoId, title: item.title, uploadedAt: Date.now() });
+      await env.STATE.put("postedVideos", JSON.stringify(posted.slice(0, 200)));
+
+      await tgSend(env, chatId, `✅ Live now: https://youtu.be/${videoId}\n📋 ${queue.length} left in queue.`);
+    } catch (err) {
+      console.error("Manual /postnow upload failed:", err.message);
+      await tgSend(env, chatId, `❌ Upload failed: ${err.message}\nIt's still in the queue — nothing was removed.`);
     }
     return;
   }
