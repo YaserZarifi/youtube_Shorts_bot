@@ -228,6 +228,34 @@ async function handleMessage(message, env) {
     return;
   }
 
+  if (message.text === "/help" || message.text === "/start") {
+    const helpText = `🤖 <b>Reels → YouTube Bot</b>
+
+<b>Uploading a video:</b>
+Just send a video (under 20MB). I'll ask what it's about, generate a Persian title/description/hashtags with AI, and let you accept or use your own text as the title. It then goes into the upload queue.
+
+<b>Queue commands:</b>
+/queue — see all queued videos with their scheduled date & time
+/postnow (position) — upload a specific queued video immediately, bypassing the schedule (e.g. /postnow 2)
+/setschedule (position) YYYY-MM-DD HH:MM — set a custom date/time for a queued video (e.g. /setschedule 2 2026-08-05 18:30). If it's too close to another upload, I'll adjust it to respect the minimum gap and tell you the real time.
+/remove (position) — delete one video from the queue (e.g. /remove 1)
+/clearqueue — wipe the entire queue
+
+<b>History:</b>
+/posted — see the last 10 videos actually posted to YouTube, with live view counts
+
+<b>How scheduling works:</b>
+Videos auto-post at most ${env.MAX_UPLOADS_PER_DAY || "3"} per day, at least ${env.MIN_HOURS_BETWEEN_UPLOADS || "5"} hours apart, checked every hour. This spacing helps avoid your own Shorts competing with each other on the same day.
+
+<b>Access:</b>
+This bot only responds to your authorized Telegram accounts.
+
+/help — show this message again`;
+
+    await tgSend(env, chatId, helpText);
+    return;
+  }
+
   if (message.text === "/queue") {
     const queue = await getQueue(env);
     if (queue.length === 0) {
