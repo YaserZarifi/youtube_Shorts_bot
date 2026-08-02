@@ -9,6 +9,54 @@ export async function generateMetadata(env, userText) {
 
 // Respond ONLY with valid JSON, no markdown, no explanation, in this exact shape:
 // {"title": "...", "description": "...", "hashtags": ["tag1", "tag2"]}`;
+// const prompt = `You are an expert YouTube Shorts content writer and SEO specialist.
+
+// The creator uploads Persian (Farsi) YouTube Shorts focused on:
+// - Persian poetry
+// - Emotional music
+// - Deep quotes
+// - Sad, romantic, nostalgic, motivational, and meaningful content
+
+// The audience is primarily Persian-speaking viewers. All generated text MUST be in natural, fluent Persian unless the user explicitly requests another language.
+
+// The creator's note about this video:
+// "${userText}"
+
+// Generate:
+
+// 1. title
+// - Write a highly clickable YouTube Shorts title.
+// - Maximum 90 characters.
+// - Emotional and curiosity-driven.
+// - Sound natural, not clickbait or spam.
+// - Match the video's mood.
+
+
+// 2. description
+// - Write 2-3 engaging Persian sentences.
+// - Encourage viewers to like, comment, and subscribe naturally.
+// - Include relevant keywords for YouTube search.
+// - Do not use excessive emojis (maximum 1).
+// - if the "userText" contains #شعر hashtag, make sure to include the exact "usertext" in top of the description!
+
+// 3. hashtags
+// - Return 5-8 highly relevant hashtags.
+// - Persian hashtags are preferred.
+// - Mix niche and popular hashtags.
+// - Return words only, WITHOUT the # symbol.
+// - No duplicates.
+
+// Return ONLY valid JSON.
+// Do not include markdown, explanations, or extra text.
+
+// Use exactly this schema:
+
+// {
+//   "title": "...",
+//   "description": "...",
+//   "hashtags": ["...", "..."]
+// }`;
+
 const prompt = `You are an expert YouTube Shorts content writer and SEO specialist.
 
 The creator uploads Persian (Farsi) YouTube Shorts focused on:
@@ -26,25 +74,53 @@ Generate:
 
 1. title
 - Write a highly clickable YouTube Shorts title.
-- Maximum 90 characters.
+- Maximum 90 characters minimum 30 characters.
 - Emotional and curiosity-driven.
 - Sound natural, not clickbait or spam.
 - Match the video's mood.
-
 
 2. description
 - Write 2-3 engaging Persian sentences.
 - Encourage viewers to like, comment, and subscribe naturally.
 - Include relevant keywords for YouTube search.
 - Do not use excessive emojis (maximum 1).
-- if the "userText" contains #شعر hashtag, make sure to include the exact "usertext" in top of the description!
+
+Special rule for poetry videos:
+
+If the creator's note contains the exact hashtag "#شعر", treat everything after that hashtag as the original poem/text.
+
+In that case:
+- Remove the "#شعر" hashtag itself.
+- Place the extracted poem/text at the VERY TOP of the description exactly as provided.
+- Preserve the original formatting and line breaks.
+- Do NOT rewrite, summarize, correct, translate, or modify the poem in any way.
+- Leave one blank line after the poem, then write the generated description below it.
+
+If "#شعر" is not present, generate the description normally.
 
 3. hashtags
-- Return 5-8 highly relevant hashtags.
-- Persian hashtags are preferred.
-- Mix niche and popular hashtags.
-- Return words only, WITHOUT the # symbol.
-- No duplicates.
+Generate 7-10 hashtags following these rules:
+
+Always include these static hashtags:
+- shorts
+- youtubeshorts
+- شعر
+- موسیقی
+
+Then generate the remaining hashtags dynamically based on the creator's note and the video's content. Consider:
+- The poem's emotion (love, sadness, hope, nostalgia, loneliness, motivation, spirituality, etc.)
+- The poet (if mentioned)
+- The music style
+- The video's subject
+- The overall mood
+
+Rules:
+- Prefer Persian hashtags whenever possible.
+- English hashtags should only be internationally recognized ones (like shorts and youtubeshorts).
+- Do NOT use generic hashtags such as:
+  viral, fyp, foryou, explore, trending, xyzbca
+- Do not generate duplicate hashtags.
+- Return hashtags WITHOUT the # symbol.
 
 Return ONLY valid JSON.
 Do not include markdown, explanations, or extra text.
@@ -54,7 +130,14 @@ Use exactly this schema:
 {
   "title": "...",
   "description": "...",
-  "hashtags": ["...", "..."]
+  "hashtags": [
+    "shorts",
+    "youtubeshorts",
+    "شعر",
+    "موسیقی",
+    "...",
+    "..."
+  ]
 }`;
 
   const result = await env.AI.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
