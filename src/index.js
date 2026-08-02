@@ -151,8 +151,18 @@ export default {
 async function processQueueTick(env) {
   const paused = await env.STATE.get("queuePaused");
   if (paused) {
-    console.log("Queue is paused:", paused);
-    return;
+    const lastUploadAt = parseInt((await env.STATE.get("lastUploadAt")) || "0", 10);
+    const hoursSinceLastUpload = lastUploadAt ? (Date.now() - lastUploadAt) / (1000 * 60 * 60) : 0;
+    if (lastUploadAt && hoursSinceLastUpload >= 24) {
+      await env.STATE.delete("queuePaused");
+      const notifyId = (env.MY_TELEGRAM_USER_ID || "").split(",")[0].trim();
+      if (notifyId) {
+        await tgSend(env, notifyId, `▶️ Queue auto-resumed — it's been 24h since your last upload, so quota should have reset. I'll try the next video on the next hourly check.`);
+      }
+    } else {
+      console.log("Queue is paused:", paused);
+      return;
+    }
   }
 
   const maxPerDay = parseInt(env.MAX_UPLOADS_PER_DAY || "3", 10);
@@ -217,11 +227,11 @@ async function processQueueTick(env) {
     console.error("Queued upload failed:", err.message);
 
     if (isQuotaError(err.message)) {
-      await env.STATE.put("queuePaused", "YouTube daily quota exceeded", { expirationTtl: 60 * 60 * 26 });
+      await env.STATE.put("queuePaused", "YouTube daily quota exceeded");
       await tgSend(
         env,
         item.chatId,
-        `🚫 YouTube upload quota exceeded. The queue is now PAUSED so it doesn't keep failing.\n\nSend /resumequeue once your quota has reset (usually resets around midnight Pacific Time) or once you've fixed the issue.`
+        `🚫 YouTube upload quota exceeded. The queue is now PAUSED.\n\nIt'll auto-resume 24h after your last successful upload, or send /resumequeue to override manually.`
       );
       return;
     }
@@ -319,7 +329,7 @@ This bot only responds to your authorized Telegram accounts.
 
   if (message.text === "/queue") {
     const paused = await env.STATE.get("queuePaused");
-    const pausedNote = paused ? `⏸️ Queue is currently PAUSED (${paused}). Send /resumequeue to continue.\n\n` : "";
+    const pausedNote = paused ? `⏸️ Queue is currently PAUSED (${paused}). Auto-resumes 24h after your last upload, or send /resumequeue now.\n\n` : "";
     const queue = await getQueue(env);
     if (queue.length === 0) {
       await tgSend(env, chatId, `${pausedNote}📋 Queue is empty.`);
