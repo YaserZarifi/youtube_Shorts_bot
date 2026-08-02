@@ -64,5 +64,15 @@
       "binding": "STATE",
       "id": "b78b0821654e45b3aa97fd2d07d21e76"
     }
-  ]
+  ],
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
+  "vars": {
+    "MAX_UPLOADS_PER_DAY": "3",
+    "MIN_HOURS_BETWEEN_UPLOADS": "6"
+  }
 }
+
+
+

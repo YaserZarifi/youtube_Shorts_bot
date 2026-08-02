@@ -3,7 +3,15 @@ import { generateMetadata } from "./ai.js";
 import { uploadShort } from "./youtube.js";
 
 const MAX_BYTES = 20 * 1024 * 1024; // Telegram bot download cap
-const DAILY_UPLOAD_LIMIT = 6; // conservative YouTube quota estimate
+
+async function getQueue(env) {
+  const raw = await env.STATE.get("queue");
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function saveQueue(env, queue) {
+  await env.STATE.put("queue", JSON.stringify(queue));
+}
 
 export default {
   async fetch(request, env) {
@@ -24,7 +32,65 @@ export default {
     }
     return new Response("ok");
   },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(processQueueTick(env));
+  },
 };
+
+async function processQueueTick(env) {
+  const maxPerDay = parseInt(env.MAX_UPLOADS_PER_DAY || "3", 10);
+  const minHoursGap = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "6");
+
+  const today = new Date().toISOString().slice(0, 10);
+  const countKey = `ytcount:${today}`;
+  const count = parseInt((await env.STATE.get(countKey)) || "0", 10);
+  if (count >= maxPerDay) {
+    console.log("Daily upload cap reached, skipping this tick.");
+    return;
+  }
+
+  const lastUploadAt = parseInt((await env.STATE.get("lastUploadAt")) || "0", 10);
+  const hoursSinceLast = (Date.now() - lastUploadAt) / (1000 * 60 * 60);
+  if (lastUploadAt && hoursSinceLast < minHoursGap) {
+    console.log(`Only ${hoursSinceLast.toFixed(1)}h since last upload, need ${minHoursGap}h. Skipping.`);
+    return;
+  }
+
+  const queue = await getQueue(env);
+  if (queue.length === 0) {
+    console.log("Queue empty, nothing to post.");
+    return;
+  }
+
+  const item = queue[0];
+  const videoBytes = await env.STATE.get(item.videoKey, "arrayBuffer");
+  if (!videoBytes) {
+    console.error("Queued video missing from storage, dropping item:", item.id);
+    queue.shift();
+    await saveQueue(env, queue);
+    return;
+  }
+
+  try {
+    const videoId = await uploadShort(env, videoBytes, {
+      title: item.title,
+      description: item.description,
+      tags: item.hashtags,
+    });
+
+    queue.shift();
+    await saveQueue(env, queue);
+    await env.STATE.delete(item.videoKey);
+    await env.STATE.put(countKey, (count + 1).toString(), { expirationTtl: 60 * 60 * 26 });
+    await env.STATE.put("lastUploadAt", Date.now().toString());
+
+    await tgSend(env, item.chatId, `✅ Queued video is live: https://youtu.be/${videoId}\n📋 ${queue.length} left in queue.`);
+  } catch (err) {
+    console.error("Queued upload failed:", err.message);
+    await tgSend(env, item.chatId, `❌ Scheduled upload failed for "${item.title}": ${err.message}`);
+  }
+}
 
 async function handleMessage(message, env) {
   const chatId = message.chat.id;
@@ -60,6 +126,17 @@ async function handleMessage(message, env) {
     return;
   }
 
+  if (message.text === "/queue") {
+    const queue = await getQueue(env);
+    if (queue.length === 0) {
+      await tgSend(env, chatId, "📋 Queue is empty.");
+    } else {
+      const list = queue.map((q, i) => `${i + 1}. ${q.title}`).join("\n");
+      await tgSend(env, chatId, `📋 ${queue.length} video(s) queued:\n${list}`);
+    }
+    return;
+  }
+
   if (message.text) {
     const pendingRaw = await env.STATE.get(`pending:${chatId}`);
     if (!pendingRaw) {
@@ -89,12 +166,64 @@ async function handleMessage(message, env) {
   }
 }
 
+// async function handleCallback(cq, env) {
+//   const chatId = cq.message.chat.id;
+//   const userId = cq.from.id.toString();
+//   if (userId !== env.MY_TELEGRAM_USER_ID) return;
+
+//   await tgAnswerCallback(env, cq.id, "Processing...");
+
+//   const draftRaw = await env.STATE.get(`draft:${chatId}`);
+//   if (!draftRaw) {
+//     await tgEditMessage(env, chatId, cq.message.message_id, "This request expired, please resend the video.");
+//     return;
+//   }
+//   const draft = JSON.parse(draftRaw);
+
+//   const today = new Date().toISOString().slice(0, 10);
+//   const countKey = `ytcount:${today}`;
+//   const count = parseInt((await env.STATE.get(countKey)) || "0", 10);
+//   if (count >= DAILY_UPLOAD_LIMIT) {
+//     await tgEditMessage(env, chatId, cq.message.message_id, "🚫 Daily YouTube upload quota reached. Try again tomorrow.");
+//     return;
+//   }
+
+//   let title, description, tags;
+//   if (cq.data === "accept") {
+//     ({ title, description, hashtags: tags } = draft);
+//   } else {
+//     title = draft.originalText.slice(0, 100);
+//     description = "";
+//     tags = [];
+//   }
+
+//   await tgEditMessage(env, chatId, cq.message.message_id, "⏫ Uploading to YouTube...");
+
+//   const videoBytes = await env.STATE.get(draft.r2Key, "arrayBuffer");
+//   if (!videoBytes) {
+//     await tgEditMessage(env, chatId, cq.message.message_id, "⚠️ Video expired from storage, please resend it.");
+//     return;
+//   }
+
+//   try {
+//     const videoId = await uploadShort(env, videoBytes, { title, description, tags });
+//     await env.STATE.put(countKey, (count + 1).toString(), { expirationTtl: 60 * 60 * 26 });
+//     await env.STATE.delete(draft.r2Key);
+//     await env.STATE.delete(`draft:${chatId}`);
+//     await env.STATE.delete(`pending:${chatId}`);
+//     await tgEditMessage(env, chatId, cq.message.message_id, `✅ Uploaded! https://youtu.be/${videoId}`);
+//   } catch (err) {
+//     await tgEditMessage(env, chatId, cq.message.message_id, "❌ Upload failed: " + err.message);
+//   }
+// }
+
+
 async function handleCallback(cq, env) {
   const chatId = cq.message.chat.id;
   const userId = cq.from.id.toString();
   if (userId !== env.MY_TELEGRAM_USER_ID) return;
 
-  await tgAnswerCallback(env, cq.id, "Processing...");
+  await tgAnswerCallback(env, cq.id, "Added to queue");
 
   const draftRaw = await env.STATE.get(`draft:${chatId}`);
   if (!draftRaw) {
@@ -102,14 +231,6 @@ async function handleCallback(cq, env) {
     return;
   }
   const draft = JSON.parse(draftRaw);
-
-  const today = new Date().toISOString().slice(0, 10);
-  const countKey = `ytcount:${today}`;
-  const count = parseInt((await env.STATE.get(countKey)) || "0", 10);
-  if (count >= DAILY_UPLOAD_LIMIT) {
-    await tgEditMessage(env, chatId, cq.message.message_id, "🚫 Daily YouTube upload quota reached. Try again tomorrow.");
-    return;
-  }
 
   let title, description, tags;
   if (cq.data === "accept") {
@@ -120,22 +241,27 @@ async function handleCallback(cq, env) {
     tags = [];
   }
 
-  await tgEditMessage(env, chatId, cq.message.message_id, "⏫ Uploading to YouTube...");
-
   const videoBytes = await env.STATE.get(draft.r2Key, "arrayBuffer");
   if (!videoBytes) {
     await tgEditMessage(env, chatId, cq.message.message_id, "⚠️ Video expired from storage, please resend it.");
     return;
   }
 
-  try {
-    const videoId = await uploadShort(env, videoBytes, { title, description, tags });
-    await env.STATE.put(countKey, (count + 1).toString(), { expirationTtl: 60 * 60 * 26 });
-    await env.STATE.delete(draft.r2Key);
-    await env.STATE.delete(`draft:${chatId}`);
-    await env.STATE.delete(`pending:${chatId}`);
-    await tgEditMessage(env, chatId, cq.message.message_id, `✅ Uploaded! https://youtu.be/${videoId}`);
-  } catch (err) {
-    await tgEditMessage(env, chatId, cq.message.message_id, "❌ Upload failed: " + err.message);
-  }
+  const queueId = `${chatId}-${Date.now()}`;
+  const queueVideoKey = `queuevideo:${queueId}`;
+  await env.STATE.put(queueVideoKey, videoBytes, { expirationTtl: 60 * 60 * 24 * 30 }); // 30 days
+  await env.STATE.delete(draft.r2Key);
+  await env.STATE.delete(`draft:${chatId}`);
+  await env.STATE.delete(`pending:${chatId}`);
+
+  const queue = await getQueue(env);
+  queue.push({ id: queueId, videoKey: queueVideoKey, title, description, hashtags: tags, chatId });
+  await saveQueue(env, queue);
+
+  await tgEditMessage(
+    env,
+    chatId,
+    cq.message.message_id,
+    `📋 Added to queue at position ${queue.length}. I'll space it out automatically and message you the link once it's live.`
+  );
 }
