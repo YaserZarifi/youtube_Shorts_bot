@@ -70,7 +70,8 @@
   },
   "vars": {
     "MAX_UPLOADS_PER_DAY": "3",
-    "MIN_HOURS_BETWEEN_UPLOADS": "6"
+    "MIN_HOURS_BETWEEN_UPLOADS": "6",
+    "DISPLAY_TIMEZONE": "Asia/Kabul"
   }
 }
 

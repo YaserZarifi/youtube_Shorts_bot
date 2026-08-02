@@ -13,6 +13,56 @@ async function saveQueue(env, queue) {
   await env.STATE.put("queue", JSON.stringify(queue));
 }
 
+function dateKey(ms, timeZone) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
+}
+
+function formatReadable(ms, timeZone) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  }).format(new Date(ms));
+}
+
+async function computeScheduleTimes(env, queueLength) {
+  const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+  const maxPerDay = parseInt(env.MAX_UPLOADS_PER_DAY || "3", 10);
+  const gapHours = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "6");
+  const gapMs = gapHours * 60 * 60 * 1000;
+
+  const now = Date.now();
+  const today = new Date().toISOString().slice(0, 10);
+  const usedTodayCount = parseInt((await env.STATE.get(`ytcount:${today}`)) || "0", 10);
+  const lastUploadAt = parseInt((await env.STATE.get("lastUploadAt")) || "0", 10);
+
+  let nextTime = lastUploadAt ? lastUploadAt + gapMs : now;
+  if (nextTime < now) nextTime = now;
+
+  let usedToday = usedTodayCount;
+  let currentDayKey = dateKey(nextTime, timeZone);
+
+  const times = [];
+  for (let i = 0; i < queueLength; i++) {
+    while (usedToday >= maxPerDay) {
+      // push forward hour by hour until the calendar day (in target timezone) changes
+      do {
+        nextTime += 60 * 60 * 1000;
+      } while (dateKey(nextTime, timeZone) === currentDayKey);
+      currentDayKey = dateKey(nextTime, timeZone);
+      usedToday = 0;
+    }
+    times.push(nextTime);
+    usedToday++;
+    nextTime += gapMs;
+  }
+  return times;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -131,8 +181,16 @@ async function handleMessage(message, env) {
     if (queue.length === 0) {
       await tgSend(env, chatId, "📋 Queue is empty.");
     } else {
-      const list = queue.map((q, i) => `${i + 1}. ${escapeHtml(q.title)}`).join("\n");
-      await tgSend(env, chatId, `📋 ${queue.length} video(s) queued:\n${list}\n\nTo remove one, send: /remove (position number)\nTo clear everything: /clearqueue`);
+      const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+      const scheduleTimes = await computeScheduleTimes(env, queue.length);
+      const list = queue
+        .map((q, i) => `${i + 1}. ${escapeHtml(q.title)}\n   🕒 ${formatReadable(scheduleTimes[i], timeZone)}`)
+        .join("\n\n");
+      await tgSend(
+        env,
+        chatId,
+        `📋 ${queue.length} video(s) queued:\n\n${list}\n\nTo remove one, send: /remove (position number)\nTo clear everything: /clearqueue`
+      );
     }
     return;
   }
