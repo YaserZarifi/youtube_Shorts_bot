@@ -4,6 +4,14 @@ import { uploadShort, getVideoStats } from "./youtube.js";
 
 const MAX_BYTES = 20 * 1024 * 1024; // Telegram bot download cap
 
+function isAuthorized(env, userId) {
+  const allowed = (env.MY_TELEGRAM_USER_ID || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+  return allowed.includes(userId.toString());
+}
+
 async function getQueue(env) {
   const raw = await env.STATE.get("queue");
   return raw ? JSON.parse(raw) : [];
@@ -190,7 +198,7 @@ async function handleMessage(message, env) {
   const chatId = message.chat.id;
   const userId = message.from.id.toString();
 
-  if (userId !== env.MY_TELEGRAM_USER_ID) {
+  if (!isAuthorized(env, userId)) {
     await tgSend(env, chatId, "This bot is private.");
     return;
   }
@@ -466,7 +474,7 @@ async function handleMessage(message, env) {
 async function handleCallback(cq, env) {
   const chatId = cq.message.chat.id;
   const userId = cq.from.id.toString();
-  if (userId !== env.MY_TELEGRAM_USER_ID) return;
+  if (!isAuthorized(env, userId)) return;
 
   await tgAnswerCallback(env, cq.id, "Added to queue");
 
