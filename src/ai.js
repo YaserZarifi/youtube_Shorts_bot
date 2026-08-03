@@ -180,9 +180,16 @@ Use exactly this schema:
   const aiTags = Array.isArray(parsed?.hashtags) ? parsed.hashtags.map((t) => String(t).replace(/^#/, "")) : [];
   const hashtags = [...new Set([...staticTags, ...aiTags])];
 
+  const baseTitle = (parsed?.title && parsed.title.trim()) ? parsed.title.slice(0, 100) : fallbackTitle;
+  const finalTitle = `${baseTitle} #shorts #فارسی`;
+
+  const hashtagsText = hashtags.map((h) => `#${h}`).join(" ");
+  const baseDescription = parsed?.description?.trim() || "";
+  const finalDescription = `${baseDescription}\n\n${hashtagsText}`.trim();
+
   return {
-    title: (parsed?.title && parsed.title.trim()) ? parsed.title.slice(0, 100) : fallbackTitle,
-    description: parsed?.description?.trim() || "",
+    title: finalTitle,
+    description: finalDescription,
     hashtags,
   };
 }
