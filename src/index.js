@@ -683,13 +683,56 @@ This bot only responds to your authorized Telegram accounts.
       tokenStatus = `❌ ${err.message}`;
     }
 
+    const currentStorage = queue.reduce((acc, item) => acc + (item.fileSize || (20 * 1024 * 1024)), 0);
+    const usedMb = (currentStorage / (1024 * 1024)).toFixed(1);
+    const maxMb = 800;
+
+    const avgSize = queue.length > 0 ? currentStorage / queue.length : 20 * 1024 * 1024;
+    const remainingStorageBytes = Math.max(0, (maxMb * 1024 * 1024) - currentStorage);
+    const remainingByStorage = Math.floor(remainingStorageBytes / avgSize);
+
+    let remainingBySchedule = 0;
+    const MAX_TTL_MS = 28 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    let testQueue = [...queue];
+
+    while (true) {
+      testQueue.push({ id: `test-${testQueue.length}` });
+      const times = await computeScheduleTimes(env, testQueue);
+      if (times[times.length - 1] - now > MAX_TTL_MS) {
+        break;
+      }
+      remainingBySchedule++;
+    }
+
+    let bottleneck = "";
+    let maxAllowedNew = 0;
+
+    if (remainingBySchedule < remainingByStorage) {
+      bottleneck = "28-Day Expiration Schedule Window";
+      maxAllowedNew = remainingBySchedule;
+    } else if (remainingByStorage < remainingBySchedule) {
+      bottleneck = "KV Storage Capacity Limit (800MB)";
+      maxAllowedNew = remainingByStorage;
+    } else {
+      bottleneck = "KV Storage & 28-Day Expiration Window";
+      maxAllowedNew = remainingByStorage;
+    }
+
+    const avgMbStr = (avgSize / (1024 * 1024)).toFixed(1);
+
     const statusText = `📊 <b>Bot Status</b>
 
 📋 Queue: ${queue.length} video(s)
+💾 KV Storage: ${usedMb}MB / ${maxMb}MB used (avg ${avgMbStr}MB/video)
 📅 Today's uploads: ${count}/${maxPerDay}
 🕒 Last upload: ${lastUploadAt ? formatReadable(lastUploadAt, timeZone) : "never"}
 ⏸️ Paused: ${paused ? `yes (${paused})` : "no"}
-🔑 YouTube token: ${tokenStatus}`;
+🔑 YouTube token: ${tokenStatus}
+
+🚦 <b>Capacity & Bottleneck</b>
+➕ Max new videos allowed: <b>${maxAllowedNew}</b>
+⚠️ Current Bottleneck: <b>${bottleneck}</b>`;
 
     await tgSend(env, chatId, statusText);
     return;
