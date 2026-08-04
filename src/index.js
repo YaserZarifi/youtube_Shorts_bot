@@ -520,7 +520,11 @@ This bot only responds to your authorized Telegram accounts.
       const timeZone = env.DISPLAY_TIMEZONE || "UTC";
       const scheduleTimes = await computeScheduleTimes(env, queue);
       const list = queue
-        .map((q, i) => `${i + 1}. ${escapeHtml(q.title)}\n   🕒 ${formatReadable(scheduleTimes[i], timeZone)}`)
+        .map((q, i) => {
+          const sizeMb = ((q.fileSize || (20 * 1024 * 1024)) / (1024 * 1024)).toFixed(1);
+          const shortTitle = q.title.length > 40 ? q.title.substring(0, 37) + "..." : q.title;
+          return `<b>${i + 1}.</b> ${escapeHtml(shortTitle)}\n   └ 🕒 ${formatReadable(scheduleTimes[i], timeZone)} · 📁 ${sizeMb}MB`;
+        })
         .join("\n\n");
       await tgSend(
         env,
