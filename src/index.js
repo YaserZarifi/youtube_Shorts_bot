@@ -11,6 +11,15 @@ const FILTER_WORDS = new Set([
 const TITLE_SUFFIX = " #shorts #persian #فارسی";
 const MAX_TITLE_LENGTH = 100;
 
+const UPLOAD_SCHEDULE = {
+  uploadsPerDay: 3,
+  windows: [
+    { start: "14:00", end: "15:00" },
+    { start: "18:00", end: "20:00" },
+    { start: "21:00", end: "23:00" },
+  ],
+};
+
 function cleanCaption(text = "") {
   let cleaned = text;
 
@@ -111,72 +120,58 @@ function parseLocalDateTime(dateStr, timeStr, timeZone) {
   return guess;
 }
 
-function getLocalHour(ms, timeZone) {
-  const dtf = new Intl.DateTimeFormat("en-US", { timeZone, hour12: false, hour: "2-digit" });
-  const hour = parseInt(dtf.format(new Date(ms)), 10);
-  return hour === 24 ? 0 : hour;
-}
-
-function isWithinPostingWindow(ms, timeZone, startHour, endHour) {
-  if (startHour === endHour) return true; // window disabled (full day allowed)
-  const h = getLocalHour(ms, timeZone);
-  if (startHour < endHour) {
-    return h >= startHour && h < endHour;
-  }
-  // window wraps past midnight (e.g. 13 -> 1)
-  return h >= startHour || h < endHour;
-}
-
-function nextWindowStart(ms, timeZone, startHour) {
-  const dateStr = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
-  let candidate = parseLocalDateTime(dateStr, `${String(startHour).padStart(2, "0")}:00`, timeZone);
-  if (candidate <= ms) candidate += 24 * 60 * 60 * 1000;
-  return candidate;
-}
-
 async function computeScheduleTimes(env, queueItems) {
   const timeZone = env.DISPLAY_TIMEZONE || "UTC";
-  const maxPerDay = parseInt(env.MAX_UPLOADS_PER_DAY || "3", 10);
-  const gapHours = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "6");
-  const gapMs = gapHours * 60 * 60 * 1000;
-  const windowStartHour = parseInt(env.POSTING_WINDOW_START_HOUR ?? "13", 10);
-  const windowEndHour = parseInt(env.POSTING_WINDOW_END_HOUR ?? "1", 10);
-
   const now = Date.now();
-  const today = new Date().toISOString().slice(0, 10);
-  const usedTodayCount = parseInt((await env.STATE.get(`ytcount:${today}`)) || "0", 10);
-  const lastUploadAt = parseInt((await env.STATE.get("lastUploadAt")) || "0", 10);
+  let currentDayStr = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(now));
 
-  let cursor = lastUploadAt ? lastUploadAt + gapMs : now;
-  if (cursor < now) cursor = now;
+  const utcToday = new Date(now).toISOString().slice(0, 10);
+  const usedTodayCount = parseInt((await env.STATE.get(`ytcount:${utcToday}`)) || "0", 10);
 
-  let usedToday = usedTodayCount;
-  let currentDayKey = dateKey(cursor, timeZone);
-
+  let currentDayMidnight = parseLocalDateTime(currentDayStr, "00:00", timeZone);
+  let windowIndex = usedTodayCount;
+  let cursor = now;
   const times = [];
+
   for (const item of queueItems) {
-    let candidate = item.manualScheduledAt ? Math.max(item.manualScheduledAt, cursor) : cursor;
-
-    if (!item.manualScheduledAt && !isWithinPostingWindow(candidate, timeZone, windowStartHour, windowEndHour)) {
-      candidate = nextWindowStart(candidate, timeZone, windowStartHour);
+    if (item.manualScheduledAt) {
+      const mTime = Math.max(item.manualScheduledAt, cursor);
+      times.push(mTime);
+      cursor = mTime + 1;
+      continue;
     }
 
-    let candidateDayKey = dateKey(candidate, timeZone);
-    if (candidateDayKey !== currentDayKey) {
-      usedToday = 0;
-      currentDayKey = candidateDayKey;
-    }
-    while (usedToday >= maxPerDay) {
-      do {
-        candidate += 60 * 60 * 1000;
-      } while (dateKey(candidate, timeZone) === currentDayKey);
-      currentDayKey = dateKey(candidate, timeZone);
-      usedToday = 0;
-    }
+    while (true) {
+      if (windowIndex >= UPLOAD_SCHEDULE.windows.length) {
+        currentDayMidnight += 24 * 60 * 60 * 1000;
+        currentDayStr = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(currentDayMidnight));
+        currentDayMidnight = parseLocalDateTime(currentDayStr, "00:00", timeZone);
+        windowIndex = 0;
+      }
 
-    times.push(candidate);
-    usedToday++;
-    cursor = candidate + gapMs;
+      const win = UPLOAD_SCHEDULE.windows[windowIndex];
+      const [startH, startM] = win.start.split(":").map(Number);
+      const [endH, endM] = win.end.split(":").map(Number);
+      const startMs = currentDayMidnight + ((startH * 60 + startM) * 60000);
+      const endMs = currentDayMidnight + ((endH * 60 + endM) * 60000);
+
+      let hash = 0;
+      const seedStr = item.id + currentDayStr + windowIndex;
+      for (let i = 0; i < seedStr.length; i++) {
+        hash = (Math.imul(31, hash) + seedStr.charCodeAt(i)) | 0;
+      }
+      const randomDec = Math.abs(Math.sin(hash || 1));
+      const randomMs = startMs + Math.floor(randomDec * (endMs - startMs));
+
+      if (randomMs > cursor) {
+        times.push(randomMs);
+        cursor = randomMs + 1;
+        windowIndex++;
+        break;
+      } else {
+        windowIndex++;
+      }
+    }
   }
   return times;
 }
@@ -274,46 +269,24 @@ async function processQueueTick(env) {
     }
   }
 
-  const maxPerDay = parseInt(env.MAX_UPLOADS_PER_DAY || "3", 10);
-  const minHoursGap = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "6");
-
-  const today = new Date().toISOString().slice(0, 10);
-  const countKey = `ytcount:${today}`;
-  const count = parseInt((await env.STATE.get(countKey)) || "0", 10);
-  if (count >= maxPerDay) {
-    console.log("Daily upload cap reached, skipping this tick.");
-    return;
-  }
-
-  const lastUploadAt = parseInt((await env.STATE.get("lastUploadAt")) || "0", 10);
-  const hoursSinceLast = (Date.now() - lastUploadAt) / (1000 * 60 * 60);
-  if (lastUploadAt && hoursSinceLast < minHoursGap) {
-    console.log(`Only ${hoursSinceLast.toFixed(1)}h since last upload, need ${minHoursGap}h. Skipping.`);
-    return;
-  }
-
   const queue = await getQueue(env);
   if (queue.length === 0) {
     console.log("Queue empty, nothing to post.");
     return;
   }
 
-  const item = queue[0];
+  const scheduleTimes = await computeScheduleTimes(env, queue);
+  const nextTime = scheduleTimes[0];
 
-  if (item.manualScheduledAt && Date.now() < item.manualScheduledAt) {
-    console.log("Next queued item has a future manual schedule, waiting.");
+  if (Date.now() < nextTime) {
+    console.log("Not time to post yet.");
     return;
   }
 
-  if (!item.manualScheduledAt) {
-    const timeZone = env.DISPLAY_TIMEZONE || "UTC";
-    const windowStartHour = parseInt(env.POSTING_WINDOW_START_HOUR ?? "13", 10);
-    const windowEndHour = parseInt(env.POSTING_WINDOW_END_HOUR ?? "1", 10);
-    if (!isWithinPostingWindow(Date.now(), timeZone, windowStartHour, windowEndHour)) {
-      console.log("Outside posting window, skipping this tick.");
-      return;
-    }
-  }
+  const item = queue[0];
+  const today = new Date().toISOString().slice(0, 10);
+  const countKey = `ytcount:${today}`;
+  const count = parseInt((await env.STATE.get(countKey)) || "0", 10);
 
   const videoBytes = await env.STATE.get(item.videoKey, "arrayBuffer");
   if (!videoBytes) {
@@ -388,7 +361,37 @@ async function handleMessage(message, env) {
   const media = message.video || message.document;
 
   if (media) {
-    // --- SIZE CHECK BEFORE DOWNLOADING ANYTHING ---
+    const queue = await getQueue(env);
+    const newFileSize = media.file_size || 0;
+    const currentStorage = queue.reduce((acc, item) => acc + (item.fileSize || (20 * 1024 * 1024)), 0);
+    const MAX_KV_BYTES = 800 * 1024 * 1024;
+
+    if (currentStorage + newFileSize > MAX_KV_BYTES) {
+      const usedMb = (currentStorage / (1024 * 1024)).toFixed(1);
+      await tgSend(
+        env,
+        chatId,
+        `⚠️ Cannot accept video: Storage limit reached (${usedMb}MB / 800MB reserved). Please wait for queued videos to upload.`
+      );
+      return;
+    }
+
+    const mockItem = { id: "temp-check" };
+    const simulatedTimes = await computeScheduleTimes(env, [...queue, mockItem]);
+    const projectedTime = simulatedTimes[simulatedTimes.length - 1];
+    const MAX_TTL_MS = 28 * 24 * 60 * 60 * 1000;
+
+    if (projectedTime - Date.now() > MAX_TTL_MS) {
+      const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+      const dateStr = formatReadable(projectedTime, timeZone);
+      await tgSend(
+        env,
+        chatId,
+        `⚠️ Cannot accept video: Queue schedule window full! This video would post on ${dateStr}, exceeding the 28-day storage life.`
+      );
+      return;
+    }
+
     if (media.file_size && media.file_size > MAX_BYTES) {
       await tgSend(
         env,
@@ -420,6 +423,7 @@ if (caption) {
       step: "awaiting_title_confirmation",
       r2Key: videoKey,
       originalText: caption,
+      fileSize: media.file_size || 0,
     })
   );
 
@@ -448,6 +452,7 @@ if (caption) {
     JSON.stringify({
       step: "awaiting_caption",
       r2Key: videoKey,
+      fileSize: media.file_size || 0,
     })
   );
 
@@ -481,7 +486,7 @@ Just send a video (under 20MB). I'll ask what it's about, generate a Persian tit
 /posted — see the last 10 videos actually posted to YouTube, with live view counts
 
 <b>How scheduling works:</b>
-Videos auto-post at most ${env.MAX_UPLOADS_PER_DAY || "3"} per day, at least ${env.MIN_HOURS_BETWEEN_UPLOADS || "6"} hours apart, checked every hour, and only between ${env.POSTING_WINDOW_START_HOUR || "13"}:00–${env.POSTING_WINDOW_END_HOUR || "1"}:00 (Kabul time). This spacing helps avoid your own Shorts competing with each other on the same day, and keeps posts within your target hours.
+Videos auto-post at most ${UPLOAD_SCHEDULE.uploadsPerDay} per day. They are randomly assigned an exact minute within specific configured windows (e.g. 14-15, 18-20, 21-23). This guarantees your Shorts hit high-traffic times without overlapping.
 
 <b>Access:</b>
 This bot only responds to your authorized Telegram accounts.
@@ -545,10 +550,9 @@ This bot only responds to your authorized Telegram accounts.
 
     const scheduleTimes = await computeScheduleTimes(env, queue);
     const actualTime = scheduleTimes[index];
-    const gapHours = parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "6");
     const adjustedNote =
       Math.abs(actualTime - targetMs) > 60000
-        ? `\n\n⚠️ Adjusted to keep the ${gapHours}h minimum gap — it'll actually go out at ${formatReadable(actualTime, timeZone)}.`
+        ? `\n\n⚠️ Adjusted automatically — it'll actually go out at ${formatReadable(actualTime, timeZone)}.`
         : "";
 
     await tgSend(
@@ -668,7 +672,7 @@ This bot only responds to your authorized Telegram accounts.
     const today = new Date().toISOString().slice(0, 10);
     const countKey = `ytcount:${today}`;
     const count = parseInt((await env.STATE.get(countKey)) || "0", 10);
-    const maxPerDay = parseInt(env.MAX_UPLOADS_PER_DAY || "3", 10);
+    const maxPerDay = UPLOAD_SCHEDULE.uploadsPerDay;
     const lastUploadAt = parseInt((await env.STATE.get("lastUploadAt")) || "0", 10);
     const timeZone = env.DISPLAY_TIMEZONE || "UTC";
 
@@ -1033,6 +1037,7 @@ if (cq.data === "generate_ai" || cq.data === "use_raw_title") {
       ...meta,
       originalText: pending.originalText,
       r2Key: pending.r2Key,
+      fileSize: pending.fileSize || 0,
     })
   );
 
@@ -1109,7 +1114,7 @@ if (cq.data === "accept" || cq.data === "generate_ai") {
   await env.STATE.delete(`pending:${chatId}`);
 
   const queue = await getQueue(env);
-  queue.push({ id: queueId, videoKey: queueVideoKey, title, description, hashtags: tags, chatId });
+  queue.push({ id: queueId, videoKey: queueVideoKey, title, description, hashtags: tags, chatId, fileSize: draft.fileSize || 0 });
   await saveQueue(env, queue);
 
   await tgEditMessage(
