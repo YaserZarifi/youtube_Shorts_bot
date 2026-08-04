@@ -1,4 +1,4 @@
-import { tgSend, tgEditMessage, tgAnswerCallback, tgGetFileUrl, escapeHtml } from "./telegram.js";
+import { tgSend, tgEditMessage, tgAnswerCallback, tgGetFileUrl, escapeHtml, tgSetCommands } from "./telegram.js";
 import { generateMetadata } from "./ai.js";
 import { uploadShort, getVideoStats, getAccessToken } from "./youtube.js";
 
@@ -475,18 +475,18 @@ Just send a video (under 20MB). I'll ask what it's about, generate a Persian tit
 <b>Queue commands:</b>
 /queue — see all queued videos with their scheduled date & time
 /postnow (position) — upload a specific queued video immediately, bypassing the schedule (e.g. /postnow 2)
-/setschedule (position) YYYY-MM-DD HH:MM — set a custom date/time for a queued video (e.g. /setschedule 2 2026-08-05 18:30). If it's too close to another upload, I'll adjust it to respect the minimum gap and tell you the real time.
+/setschedule (position) YYYY-MM-DD HH:MM — set a custom date/time for a queued video (e.g. /setschedule 2 2026-08-05 18:30). If it's too close to another upload, I'll adjust it automatically.
 /remove (position) — delete one video from the queue (e.g. /remove 1)
 /clearqueue — wipe the entire queue
 /resumequeue — resume the queue after it's been auto-paused (e.g. YouTube quota exceeded)
-/status — quick health check (queue, quota, last upload, YouTube token)
+/status — quick health check (queue capacity, bottlenecks, token)
 /preview (position) — see full title/description/hashtags for a queued video, with edit buttons
 
 <b>History:</b>
 /posted — see the last 10 videos actually posted to YouTube, with live view counts
 
 <b>How scheduling works:</b>
-Videos auto-post at most ${UPLOAD_SCHEDULE.uploadsPerDay} per day. They are randomly assigned an exact minute within specific configured windows (e.g. 14-15, 18-20, 21-23). This guarantees your Shorts hit high-traffic times without overlapping.
+Videos auto-post at most ${UPLOAD_SCHEDULE.uploadsPerDay} per day. They are randomly assigned an exact minute within specific configured windows. The bot strictly limits your queue to prevent KV storage overflow (800MB cap) and prevents any queued videos from expiring before uploading (28-day window).
 
 <b>Access:</b>
 This bot only responds to your authorized Telegram accounts.
@@ -494,6 +494,19 @@ This bot only responds to your authorized Telegram accounts.
 /help — show this message again`;
 
     await tgSend(env, chatId, helpText);
+
+    await tgSetCommands(env, [
+      { command: "queue", description: "See all queued videos and schedule" },
+      { command: "status", description: "Check bot health, capacity, and limits" },
+      { command: "preview", description: "See full metadata for a queued video" },
+      { command: "posted", description: "See the last 10 posted videos" },
+      { command: "remove", description: "Delete one video from the queue" },
+      { command: "postnow", description: "Upload a queued video immediately" },
+      { command: "setschedule", description: "Set a custom date/time for a video" },
+      { command: "resumequeue", description: "Resume queue after being paused" },
+      { command: "clearqueue", description: "Wipe the entire queue" },
+      { command: "help", description: "Show instructions" }
+    ]);
     return;
   }
 
@@ -803,6 +816,7 @@ This bot only responds to your authorized Telegram accounts.
           step: "awaiting_ai_choice",
           r2Key: pending.r2Key,
           originalText: message.text.trim(),
+          fileSize: pending.fileSize || 0,
         })
       );
 
@@ -844,7 +858,8 @@ This bot only responds to your authorized Telegram accounts.
         JSON.stringify({
             step: "awaiting_ai_choice",
             r2Key: pending.r2Key,
-            originalText: pending.originalText
+            originalText: pending.originalText,
+            fileSize: pending.fileSize || 0,
         })
     );
 
@@ -990,6 +1005,7 @@ async function handleCallback(cq, env) {
       step: "awaiting_ai_choice",
       r2Key: pending.r2Key,
       originalText: pending.originalText,
+      fileSize: pending.fileSize || 0,
     })
   );
 
@@ -1022,16 +1038,6 @@ async function handleCallback(cq, env) {
 if (cq.data === "edit_caption_title") {
   await tgAnswerCallback(env, cq.id, "Reply with the new title");
 
-//   await env.STATE.put(
-//     `editpending:${chatId}`,
-//     JSON.stringify({
-//       type: "caption_title",
-//     }),
-//     {
-//       expirationTtl: 1800,
-//     }
-//   );
-
 const pendingRaw = await env.STATE.get(`pending:${chatId}`);
 const pending = JSON.parse(pendingRaw);
 
@@ -1040,7 +1046,8 @@ await env.STATE.put(
     JSON.stringify({
         step: "editing_caption_title",
         r2Key: pending.r2Key,
-        originalText: pending.originalText
+        originalText: pending.originalText,
+        fileSize: pending.fileSize || 0,
     })
 );
 

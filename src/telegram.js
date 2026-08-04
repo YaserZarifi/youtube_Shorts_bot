@@ -44,3 +44,14 @@ export async function tgGetFileUrl(env, fileId) {
   if (!data.ok) throw new Error("getFile failed: " + JSON.stringify(data));
   return `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${data.result.file_path}`;
 }
+
+export async function tgSetCommands(env, commands) {
+  const res = await fetch(`${TG_API(env.TELEGRAM_BOT_TOKEN)}/setMyCommands`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ commands }),
+  });
+  const data = await res.json();
+  if (!data.ok) console.error("tgSetCommands failed:", JSON.stringify(data));
+  return data;
+}
