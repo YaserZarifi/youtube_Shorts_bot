@@ -363,10 +363,54 @@ async function handleMessage(message, env) {
 
     const videoKey = `videofile:${chatId}:${media.file_unique_id}`;
     await env.STATE.put(videoKey, videoBytes, { expirationTtl: 60 * 60 * 6 }); // auto-expires in 6 hours if never confirmed
-    await env.STATE.put(`pending:${chatId}`, JSON.stringify({ step: "awaiting_caption", r2Key: videoKey }));
+    const caption = (message.caption || "").trim();
 
-    await tgSend(env, chatId, "Got the video ✅. In a short sentence, what is this about?");
-    return;
+if (caption) {
+  await env.STATE.put(
+    `pending:${chatId}`,
+    JSON.stringify({
+      step: "awaiting_title_confirmation",
+      r2Key: videoKey,
+      originalText: caption,
+    })
+  );
+
+  await tgSend(
+    env,
+    chatId,
+    `📝 I found this caption:\n\n<b>${escapeHtml(caption)}</b>\n\nUse this as the video title?\n\nYou can edit it before continuing.`,
+    {
+      inline_keyboard: [
+        [
+          {
+            text: "✅ Use this title",
+            callback_data: "use_caption_title",
+          },
+          {
+            text: "✏️ Edit title",
+            callback_data: "edit_caption_title",
+          },
+        ],
+      ],
+    }
+  );
+} else {
+  await env.STATE.put(
+    `pending:${chatId}`,
+    JSON.stringify({
+      step: "awaiting_caption",
+      r2Key: videoKey,
+    })
+  );
+
+  await tgSend(
+    env,
+    chatId,
+    "🎬 Got the video ✅\n\nPlease send me the video title/caption."
+  );
+}
+
+return;
   }
 
   if (message.text === "/help" || message.text === "/start") {
@@ -651,7 +695,45 @@ This bot only responds to your authorized Telegram accounts.
   }
 
   if (message.text) {
-    const pendingRaw = await env.STATE.get(`pending:${chatId}`);
+
+  const pendingRaw = await env.STATE.get(`pending:${chatId}`);
+
+  if (pendingRaw) {
+    const pending = JSON.parse(pendingRaw);
+
+    if (pending.step === "awaiting_title_confirmation") {
+      await env.STATE.put(
+        `pending:${chatId}`,
+        JSON.stringify({
+          step: "awaiting_ai_choice",
+          r2Key: pending.r2Key,
+          originalText: message.text.trim(),
+        })
+      );
+
+      await tgSend(
+        env,
+        chatId,
+        `✅ Title updated:\n\n<b>${escapeHtml(message.text.trim())}</b>\n\nDo you want AI to generate optimized title, description and hashtags?`,
+        {
+          inline_keyboard: [
+            [
+              {
+                text: "✨ Yes, use AI",
+                callback_data: "generate_ai",
+              },
+              {
+                text: "❌ No, use my title",
+                callback_data: "use_raw_title",
+              },
+            ],
+          ],
+        }
+      );
+
+      return;
+    }
+  }
     if (!pendingRaw) {
       await tgSend(env, chatId, "Send me a video first (under 20MB).");
       return;
@@ -659,7 +741,7 @@ This bot only responds to your authorized Telegram accounts.
     const pending = JSON.parse(pendingRaw);
     if (pending.step !== "awaiting_caption") return;
 
-    const meta = await generateMetadata(env, message.text);
+const meta = await generateMetadata(env, message.text);
 
     await env.STATE.put(`draft:${chatId}`, JSON.stringify({ ...meta, originalText: message.text, r2Key: pending.r2Key }));
     await env.STATE.put(`pending:${chatId}`, JSON.stringify({ step: "awaiting_confirmation" }));
@@ -762,6 +844,134 @@ async function handleCallback(cq, env) {
     return;
   }
 
+  if (cq.data === "use_caption_title") {
+  const pendingRaw = await env.STATE.get(`pending:${chatId}`);
+  if (!pendingRaw) return;
+
+  const pending = JSON.parse(pendingRaw);
+
+  await env.STATE.put(
+    `pending:${chatId}`,
+    JSON.stringify({
+      step: "awaiting_ai_choice",
+      r2Key: pending.r2Key,
+      originalText: pending.originalText,
+    })
+  );
+
+  await tgAnswerCallback(env, cq.id, "Title accepted");
+
+  await tgSend(
+    env,
+    chatId,
+    "Do you want AI to generate optimized title, description and hashtags?",
+    {
+      inline_keyboard: [
+        [
+          {
+            text: "✨ Yes, use AI",
+            callback_data: "generate_ai",
+          },
+          {
+            text: "❌ No, use my title",
+            callback_data: "use_raw_title",
+          },
+        ],
+      ],
+    }
+  );
+
+  return;
+}
+
+
+if (cq.data === "edit_caption_title") {
+  await tgAnswerCallback(env, cq.id, "Reply with the new title");
+
+  await env.STATE.put(
+    `editpending:${chatId}`,
+    JSON.stringify({
+      type: "caption_title",
+    }),
+    {
+      expirationTtl: 1800,
+    }
+  );
+
+  await tgSend(env, chatId, "✏️ Send the new title:", {
+    force_reply: true,
+  });
+
+  return;
+}
+
+if (cq.data === "generate_ai" || cq.data === "use_raw_title") {
+
+  const pendingRaw = await env.STATE.get(`pending:${chatId}`);
+
+  if (!pendingRaw) {
+    await tgAnswerCallback(env, cq.id, "Expired");
+    return;
+  }
+
+  const pending = JSON.parse(pendingRaw);
+
+  let meta;
+
+  if (cq.data === "generate_ai") {
+    meta = await generateMetadata(env, pending.originalText);
+  } else {
+    meta = {
+      title: pending.originalText.slice(0, 100),
+      description: "",
+      hashtags: [],
+    };
+  }
+
+  await env.STATE.put(
+    `draft:${chatId}`,
+    JSON.stringify({
+      ...meta,
+      originalText: pending.originalText,
+      r2Key: pending.r2Key,
+    })
+  );
+
+  await env.STATE.put(
+    `pending:${chatId}`,
+    JSON.stringify({
+      step: "awaiting_confirmation",
+    })
+  );
+
+  const hashtags = meta.hashtags
+    .map((h) => `#${h.replace(/^#/, "")}`)
+    .join(" ");
+
+  const preview =
+    `<b>Title:</b> ${escapeHtml(meta.title)}\n\n` +
+    `<b>Description:</b>\n${escapeHtml(meta.description || "(none)")}\n\n` +
+    `<b>Hashtags:</b> ${escapeHtml(hashtags || "(none)")}`;
+
+
+  await tgAnswerCallback(env, cq.id, "Ready");
+
+
+  await tgSend(env, chatId, preview, {
+    inline_keyboard: [
+      [
+        {
+          text: "✅ Add to queue",
+          callback_data: "accept",
+        },
+      ],
+    ],
+  });
+
+  return;
+}
+
+
   await tgAnswerCallback(env, cq.id, "Added to queue");
 
   const draftRaw = await env.STATE.get(`draft:${chatId}`);
@@ -772,13 +982,19 @@ async function handleCallback(cq, env) {
   const draft = JSON.parse(draftRaw);
 
   let title, description, tags;
-  if (cq.data === "accept") {
-    ({ title, description, hashtags: tags } = draft);
-  } else {
-    title = draft.originalText.slice(0, 100);
-    description = "";
-    tags = [];
-  }
+
+if (cq.data === "accept" || cq.data === "generate_ai") {
+  ({ title, description, hashtags: tags } = draft);
+
+} else if (cq.data === "original" || cq.data === "use_raw_title") {
+  title = draft.originalText.slice(0, 100);
+  description = "";
+  tags = [];
+
+} else {
+  await tgSend(env, chatId, "⚠️ Unknown option.");
+  return;
+}
 
   const videoBytes = await env.STATE.get(draft.r2Key, "arrayBuffer");
   if (!videoBytes) {
