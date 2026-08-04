@@ -181,7 +181,13 @@ Use exactly this schema:
   const hashtags = [...new Set([...staticTags, ...aiTags])];
 
   const baseTitle = (parsed?.title && parsed.title.trim()) ? parsed.title.slice(0, 100) : fallbackTitle;
-  const finalTitle = `${baseTitle} #shorts #فارسی`;
+  const TITLE_SUFFIX = " #shorts #persian #فارسی";
+
+let finalTitle = baseTitle;
+
+if (finalTitle.length + TITLE_SUFFIX.length <= 100) {
+  finalTitle += TITLE_SUFFIX;
+}
 
   const hashtagsText = hashtags.map((h) => `#${h}`).join(" ");
   const baseDescription = parsed?.description?.trim() || "";

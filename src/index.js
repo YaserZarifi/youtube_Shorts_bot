@@ -4,6 +4,54 @@ import { uploadShort, getVideoStats, getAccessToken } from "./youtube.js";
 
 const MAX_BYTES = 20 * 1024 * 1024; // Telegram bot download cap
 
+const FILTER_WORDS = new Set([
+  "درهوایت",
+]);
+
+const TITLE_SUFFIX = " #shorts #persian #فارسی";
+const MAX_TITLE_LENGTH = 100;
+
+function cleanCaption(text = "") {
+  let cleaned = text;
+
+  // Remove Telegram usernames
+  cleaned = cleaned.replace(/@[A-Za-z0-9_]{5,}/g, "");
+
+  // Remove Telegram links
+  cleaned = cleaned.replace(
+    /https?:\/\/(?:t\.me|telegram\.me)\/\S+|(?:t\.me|telegram\.me)\/\S+/gi,
+    ""
+  );
+
+  // Remove any remaining URLs
+  cleaned = cleaned.replace(
+    /https?:\/\/\S+|www\.\S+/gi,
+    ""
+  );
+
+  // Remove unwanted words exactly
+  for (const word of FILTER_WORDS) {
+    cleaned = cleaned.split(word).join("");
+  }
+
+  // Normalize spaces
+  cleaned = cleaned.replace(/[ \t]+/g, " ");
+
+  // Normalize blank lines
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
+
+  cleaned = cleaned.trim();
+
+  if (
+    cleaned &&
+    cleaned.length + TITLE_SUFFIX.length <= MAX_TITLE_LENGTH
+  ) {
+    cleaned += TITLE_SUFFIX;
+  }
+
+  return cleaned;
+}
+
 function isAuthorized(env, userId) {
   const allowed = (env.MY_TELEGRAM_USER_ID || "")
     .split(",")
@@ -363,7 +411,7 @@ async function handleMessage(message, env) {
 
     const videoKey = `videofile:${chatId}:${media.file_unique_id}`;
     await env.STATE.put(videoKey, videoBytes, { expirationTtl: 60 * 60 * 6 }); // auto-expires in 6 hours if never confirmed
-    const caption = (message.caption || "").trim();
+    const caption = cleanCaption(message.caption || "");
 
 if (caption) {
   await env.STATE.put(
@@ -739,11 +787,50 @@ This bot only responds to your authorized Telegram accounts.
       return;
     }
     const pending = JSON.parse(pendingRaw);
+
+    if (pending.step === "editing_caption_title") {
+
+    pending.originalText = message.text.trim();
+
+    await env.STATE.put(
+        `pending:${chatId}`,
+        JSON.stringify({
+            step: "awaiting_ai_choice",
+            r2Key: pending.r2Key,
+            originalText: pending.originalText
+        })
+    );
+
+    await tgSend(
+        env,
+        chatId,
+        `✅ Title updated!
+
+Do you want AI to generate Title + Description + Hashtags?`,
+        {
+            inline_keyboard: [[
+                {
+                    text: "✨ Yes, use AI",
+                    callback_data: "generate_ai"
+                },
+                {
+                    text: "❌ No, use my title",
+                    callback_data: "use_raw_title"
+                }
+            ]]
+        }
+    );
+
+    return;
+}
+
     if (pending.step !== "awaiting_caption") return;
 
-const meta = await generateMetadata(env, message.text);
+const cleanedInput = cleanCaption(message.text);
 
-    await env.STATE.put(`draft:${chatId}`, JSON.stringify({ ...meta, originalText: message.text, r2Key: pending.r2Key }));
+const meta = await generateMetadata(env, cleanedInput);
+
+    await env.STATE.put(`draft:${chatId}`, JSON.stringify({ ...meta, originalText: cleanedInput, r2Key: pending.r2Key }));
     await env.STATE.put(`pending:${chatId}`, JSON.stringify({ step: "awaiting_confirmation" }));
 
     const hashtags = meta.hashtags.map((h) => `#${h.replace(/^#/, "")}`).join(" ");
@@ -888,15 +975,27 @@ async function handleCallback(cq, env) {
 if (cq.data === "edit_caption_title") {
   await tgAnswerCallback(env, cq.id, "Reply with the new title");
 
-  await env.STATE.put(
-    `editpending:${chatId}`,
+//   await env.STATE.put(
+//     `editpending:${chatId}`,
+//     JSON.stringify({
+//       type: "caption_title",
+//     }),
+//     {
+//       expirationTtl: 1800,
+//     }
+//   );
+
+const pendingRaw = await env.STATE.get(`pending:${chatId}`);
+const pending = JSON.parse(pendingRaw);
+
+await env.STATE.put(
+    `pending:${chatId}`,
     JSON.stringify({
-      type: "caption_title",
-    }),
-    {
-      expirationTtl: 1800,
-    }
-  );
+        step: "editing_caption_title",
+        r2Key: pending.r2Key,
+        originalText: pending.originalText
+    })
+);
 
   await tgSend(env, chatId, "✏️ Send the new title:", {
     force_reply: true,
@@ -987,7 +1086,7 @@ if (cq.data === "accept" || cq.data === "generate_ai") {
   ({ title, description, hashtags: tags } = draft);
 
 } else if (cq.data === "original" || cq.data === "use_raw_title") {
-  title = draft.originalText.slice(0, 100);
+  title = cleanCaption(draft.originalText).slice(0, 100);
   description = "";
   tags = [];
 
