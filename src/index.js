@@ -202,9 +202,15 @@ function generateAutoSlots(env, startMs, count, blockedTimes = []) {
   const timeZone = env.DISPLAY_TIMEZONE || "UTC";
   const schedule = getSchedule(env);
   const fmt = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" });
+  const gapMs = schedule.gapMin * 60000;
   const taken = new Set(blockedTimes.map((t) => Math.floor(t / SLOT_GRID_MS)));
   const times = [];
   if (count <= 0) return times;
+
+  // An auto slot must respect MIN_HOURS_BETWEEN_UPLOADS from every manually
+  // pinned (blocked) time too, not just avoid landing in its exact bucket —
+  // otherwise a /setschedule move can leave an auto video sitting minutes away.
+  const tooCloseToBlocked = (t) => blockedTimes.some((b) => Math.abs(t - b) < gapMs);
 
   let dayStr = fmt.format(new Date(startMs));
   let dayMidnight = parseLocalDateTime(dayStr, "00:00", timeZone);
@@ -215,6 +221,7 @@ function generateAutoSlots(env, startMs, count, blockedTimes = []) {
       if (t < startMs) continue;
       const bucket = Math.floor(t / SLOT_GRID_MS);
       if (taken.has(bucket)) continue;
+      if (tooCloseToBlocked(t)) continue;
       taken.add(bucket);
       times.push(t);
     }
