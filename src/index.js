@@ -232,6 +232,86 @@ async function fetchWithRetry(url, retries = 2) {
   throw lastErr;
 }
 
+// Start the intake flow for a freshly received video. Only the Telegram file
+// pointer (fileId/fileUniqueId) goes into pending/draft state — the actual
+// bytes are downloaded from Telegram at upload time, never stored in KV.
+async function beginIntake(env, chatId, { fileId, fileUniqueId, caption, fileSize }) {
+  const cleaned = cleanCaption(caption || "");
+  if (cleaned) {
+    await env.STATE.put(
+      `pending:${chatId}`,
+      JSON.stringify({
+        step: "awaiting_title_confirmation",
+        fileId,
+        fileUniqueId,
+        originalText: cleaned,
+        fileSize: fileSize || 0,
+      })
+    );
+    await tgSend(
+      env,
+      chatId,
+      `📝 I found this caption:\n\n<b>${escapeHtml(cleaned)}</b>\n\nUse this as the video title?\n\nYou can edit it before continuing.`,
+      {
+        inline_keyboard: [
+          [
+            { text: "✅ Use this title", callback_data: "use_caption_title" },
+            { text: "✏️ Edit title", callback_data: "edit_caption_title" },
+          ],
+        ],
+      }
+    );
+  } else {
+    await env.STATE.put(
+      `pending:${chatId}`,
+      JSON.stringify({
+        step: "awaiting_caption",
+        fileId,
+        fileUniqueId,
+        fileSize: fileSize || 0,
+      })
+    );
+    await tgSend(env, chatId, "🎬 Got the video ✅\n\nPlease send me the video title/caption.");
+  }
+}
+
+// Download a queued video's bytes fresh from Telegram right before upload.
+// file_ids can expire, so resolve a current download URL and fetch at post
+// time instead of persisting bytes in KV. Throws on failure.
+async function fetchVideoBytes(env, fileId) {
+  const fileUrl = await tgGetFileUrl(env, fileId);
+  const fileRes = await fetchWithRetry(fileUrl, 2);
+  return fileRes.arrayBuffer();
+}
+
+const QUEUE_PAGE_SIZE = 8;
+
+// Render one page of the /queue list. Positions shown are the item's real
+// queue position (global), not a per-page index, so /remove, /setschedule,
+// /postnow and /preview keep working with the numbers the user sees.
+function renderQueuePage(env, queue, page, pausedNote) {
+  const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+  const totalPages = Math.max(1, Math.ceil(queue.length / QUEUE_PAGE_SIZE));
+  const safePage = Math.min(Math.max(1, page), totalPages);
+  const start = (safePage - 1) * QUEUE_PAGE_SIZE;
+  const list = queue
+    .slice(start, start + QUEUE_PAGE_SIZE)
+    .map((q, i) => {
+      const sizeMb = ((q.fileSize || (20 * 1024 * 1024)) / (1024 * 1024)).toFixed(1);
+      const shortTitle = q.title.length > 40 ? q.title.substring(0, 37) + "..." : q.title;
+      const timeStr = q.scheduledAt ? formatReadable(q.scheduledAt, timeZone) : "unscheduled";
+      return `<b>${start + i + 1}.</b> ${escapeHtml(shortTitle)}\n   └ 🕒 ${timeStr} · 📁 ${sizeMb}MB`;
+    })
+    .join("\n\n");
+
+  const row = [];
+  if (safePage > 1) row.push({ text: "◀️ Prev", callback_data: `qp:${safePage - 1}` });
+  if (safePage < totalPages) row.push({ text: "Next ▶️", callback_data: `qp:${safePage + 1}` });
+
+  const text = `${pausedNote}📋 ${queue.length} video(s) queued (page ${safePage}/${totalPages}):\n\n${list}\n\nTo remove one, send: /remove (position number)\nTo clear everything: /clearqueue`;
+  return { text, keyboard: { inline_keyboard: [row] } };
+}
+
 async function sendWeeklyDigest(env) {
   const notifyId = (env.MY_TELEGRAM_USER_ID || "").split(",")[0].trim();
   if (!notifyId) return;
@@ -328,11 +408,32 @@ async function processQueueTick(env) {
   const countKey = `ytcount:${today}`;
   const count = parseInt((await env.STATE.get(countKey)) || "0", 10);
 
-  const videoBytes = await env.STATE.get(item.videoKey, "arrayBuffer");
-  if (!videoBytes) {
-    console.error("Queued video missing from storage, dropping item:", item.id);
-    queue.shift();
-    await saveQueue(env, queue);
+  // Fetch the video bytes fresh from Telegram right before uploading. If the
+  // original file is gone (expired file_id, deleted message), this is a
+  // distinct, unrecoverable failure — handle it separately from upload errors.
+  let videoBytes;
+  try {
+    videoBytes = await fetchVideoBytes(env, item.fileId);
+  } catch (err) {
+    console.error("Telegram fetch failed for queued item:", item.id, err.message);
+    item.fetchFailCount = (item.fetchFailCount || 0) + 1;
+    if (item.fetchFailCount >= 2) {
+      queue.shift();
+      repackQueue(env, queue);
+      await saveQueue(env, queue);
+      await tgSend(
+        env,
+        item.chatId,
+        `🗑️ Dropped "${escapeHtml(item.title)}" — the original video is no longer available on Telegram (the file expired or the message was deleted), so it can't be uploaded. Please resend it if you still want it posted.`
+      );
+    } else {
+      await saveQueue(env, queue);
+      await tgSend(
+        env,
+        item.chatId,
+        `⚠️ Couldn't fetch "${escapeHtml(item.title)}" from Telegram (attempt ${item.fetchFailCount}/2). Will retry next cycle — if it keeps failing, the original video is probably gone.`
+      );
+    }
     return;
   }
 
@@ -346,7 +447,6 @@ async function processQueueTick(env) {
     queue.shift();
     repackQueue(env, queue);
     await saveQueue(env, queue);
-    await env.STATE.delete(item.videoKey);
     await env.STATE.put(countKey, (count + 1).toString(), { expirationTtl: 60 * 60 * 26 });
     await env.STATE.put("lastUploadAt", Date.now().toString());
 
@@ -409,19 +509,6 @@ async function handleMessage(message, env) {
 
   if (media) {
     const queue = await getQueue(env);
-    const newFileSize = media.file_size || 0;
-    const currentStorage = queue.reduce((acc, item) => acc + (item.fileSize || (20 * 1024 * 1024)), 0);
-    const MAX_KV_BYTES = 800 * 1024 * 1024;
-
-    if (currentStorage + newFileSize > MAX_KV_BYTES) {
-      const usedMb = (currentStorage / (1024 * 1024)).toFixed(1);
-      await tgSend(
-        env,
-        chatId,
-        `⚠️ Cannot accept video: Storage limit reached (${usedMb}MB / 800MB reserved). Please wait for queued videos to upload.`
-      );
-      return;
-    }
 
     const autoCount = queue.filter((it) => !(it.manual && it.scheduledAt)).length;
     const blockedTimes = queue.filter((it) => it.manual && it.scheduledAt).map((it) => it.scheduledAt);
@@ -449,69 +536,44 @@ async function handleMessage(message, env) {
       return; // rejected, nothing downloaded
     }
 
-    const fileUrl = await tgGetFileUrl(env, media.file_id);
-    let fileRes;
-    try {
-      fileRes = await fetchWithRetry(fileUrl, 2);
-    } catch (err) {
-      console.error("Video download failed after retries:", err.message);
-      await tgSend(env, chatId, "⚠️ Couldn't download that video from Telegram after a few tries. Please resend it.");
+    // Dedupe against the current queue only (no extra KV reads). file_unique_id
+    // is stable per underlying file, so a repeat submission is easy to catch.
+    const dup = queue.find((q) => q.fileUniqueId && q.fileUniqueId === media.file_unique_id);
+    if (dup) {
+      await env.STATE.put(
+        `pending:${chatId}`,
+        JSON.stringify({
+          step: "awaiting_dupe_confirmation",
+          fileId: media.file_id,
+          fileUniqueId: media.file_unique_id,
+          caption: message.caption || "",
+          fileSize: media.file_size || 0,
+        }),
+        { expirationTtl: 60 * 30 }
+      );
+      await tgSend(
+        env,
+        chatId,
+        `⚠️ This looks like a video already in the queue ("${escapeHtml(dup.title)}"). Queue it again anyway?`,
+        {
+          inline_keyboard: [
+            [
+              { text: "✅ Yes, queue it again", callback_data: "dupe_confirm" },
+              { text: "❌ No, cancel", callback_data: "dupe_cancel" },
+            ],
+          ],
+        }
+      );
       return;
     }
-    const videoBytes = await fileRes.arrayBuffer();
 
-    const videoKey = `videofile:${chatId}:${media.file_unique_id}`;
-    await env.STATE.put(videoKey, videoBytes, { expirationTtl: 60 * 60 * 6 }); // auto-expires in 6 hours if never confirmed
-    const caption = cleanCaption(message.caption || "");
-
-if (caption) {
-  await env.STATE.put(
-    `pending:${chatId}`,
-    JSON.stringify({
-      step: "awaiting_title_confirmation",
-      r2Key: videoKey,
-      originalText: caption,
+    await beginIntake(env, chatId, {
+      fileId: media.file_id,
+      fileUniqueId: media.file_unique_id,
+      caption: message.caption || "",
       fileSize: media.file_size || 0,
-    })
-  );
-
-  await tgSend(
-    env,
-    chatId,
-    `📝 I found this caption:\n\n<b>${escapeHtml(caption)}</b>\n\nUse this as the video title?\n\nYou can edit it before continuing.`,
-    {
-      inline_keyboard: [
-        [
-          {
-            text: "✅ Use this title",
-            callback_data: "use_caption_title",
-          },
-          {
-            text: "✏️ Edit title",
-            callback_data: "edit_caption_title",
-          },
-        ],
-      ],
-    }
-  );
-} else {
-  await env.STATE.put(
-    `pending:${chatId}`,
-    JSON.stringify({
-      step: "awaiting_caption",
-      r2Key: videoKey,
-      fileSize: media.file_size || 0,
-    })
-  );
-
-  await tgSend(
-    env,
-    chatId,
-    "🎬 Got the video ✅\n\nPlease send me the video title/caption."
-  );
-}
-
-return;
+    });
+    return;
   }
 
   if (message.text === "/help" || message.text === "/start") {
@@ -534,7 +596,7 @@ Just send a video (under 20MB). I'll ask what it's about, generate a Persian tit
 /posted — see the last 10 videos actually posted to YouTube, with live view counts
 
 <b>How scheduling works:</b>
-Videos auto-post at most ${UPLOAD_SCHEDULE.uploadsPerDay} per day, each locked to a fixed time slot (shown in /queue) that never drifts. If you /postnow or /remove a video, the ones behind it move UP to fill the freed slots — nobody's time slides later. Use /setschedule to pin a video to your own time. The bot limits your queue to prevent KV storage overflow (800MB cap) and stops videos expiring before upload (28-day window).
+Videos auto-post at most ${UPLOAD_SCHEDULE.uploadsPerDay} per day, each locked to a fixed time slot (shown in /queue) that never drifts. If you /postnow or /remove a video, the ones behind it move UP to fill the freed slots — nobody's time slides later. Use /setschedule to pin a video to your own time. The bot limits your queue to a 28-day scheduling window so videos post before their Telegram file reference can expire.
 
 <b>Access:</b>
 This bot only responds to your authorized Telegram accounts.
@@ -558,32 +620,24 @@ This bot only responds to your authorized Telegram accounts.
     return;
   }
 
-  if (message.text === "/queue") {
+  if (message.text?.startsWith("/queue")) {
     const paused = await env.STATE.get("queuePaused");
     const pausedNote = paused ? `⏸️ Queue is currently PAUSED (${paused}). Auto-resumes 24h after your last upload, or send /resumequeue now.\n\n` : "";
     const queue = await getQueue(env);
     if (queue.length === 0) {
       await tgSend(env, chatId, `${pausedNote}📋 Queue is empty.`);
-    } else {
-      const timeZone = env.DISPLAY_TIMEZONE || "UTC";
-      // Assign times to any legacy items that predate persisted scheduling.
-      if (queue.some((q) => !q.scheduledAt)) {
-        repackQueue(env, queue);
-        await saveQueue(env, queue);
-      }
-      const list = queue
-        .map((q, i) => {
-          const sizeMb = ((q.fileSize || (20 * 1024 * 1024)) / (1024 * 1024)).toFixed(1);
-          const shortTitle = q.title.length > 40 ? q.title.substring(0, 37) + "..." : q.title;
-          return `<b>${i + 1}.</b> ${escapeHtml(shortTitle)}\n   └ 🕒 ${formatReadable(q.scheduledAt, timeZone)} · 📁 ${sizeMb}MB`;
-        })
-        .join("\n\n");
-      await tgSend(
-        env,
-        chatId,
-        `${pausedNote}📋 ${queue.length} video(s) queued:\n\n${list}\n\nTo remove one, send: /remove (position number)\nTo clear everything: /clearqueue`
-      );
+      return;
     }
+    // Assign times to any legacy items that predate persisted scheduling.
+    if (queue.some((q) => !q.scheduledAt)) {
+      repackQueue(env, queue);
+      await saveQueue(env, queue);
+    }
+    const parts = message.text.trim().split(/\s+/);
+    const pageArg = parseInt(parts[1], 10);
+    const page = isNaN(pageArg) || pageArg < 1 ? 1 : pageArg;
+    const { text, keyboard } = renderQueuePage(env, queue, page, pausedNote);
+    await tgSend(env, chatId, text, keyboard.inline_keyboard[0].length ? keyboard : undefined);
     return;
   }
 
@@ -667,13 +721,21 @@ This bot only responds to your authorized Telegram accounts.
     }
 
     const item = queue[index];
-    const videoBytes = await env.STATE.get(item.videoKey, "arrayBuffer");
-    if (!videoBytes) {
-      await tgSend(env, chatId, "⚠️ That video's data is missing from storage, can't post it.");
-      return;
-    }
 
     await tgSend(env, chatId, `⏫ Posting "${escapeHtml(item.title)}" now...`);
+
+    let videoBytes;
+    try {
+      videoBytes = await fetchVideoBytes(env, item.fileId);
+    } catch (err) {
+      console.error("Telegram fetch failed for /postnow:", item.id, err.message);
+      await tgSend(
+        env,
+        chatId,
+        `❌ Couldn't fetch "${escapeHtml(item.title)}" from Telegram — the original video may be gone (file expired or message deleted). It's still in the queue; resend the video if it's no longer recoverable.`
+      );
+      return;
+    }
 
     try {
       const videoId = await uploadShort(env, videoBytes, {
@@ -685,7 +747,6 @@ This bot only responds to your authorized Telegram accounts.
       queue.splice(index, 1);
       repackQueue(env, queue);
       await saveQueue(env, queue);
-      await env.STATE.delete(item.videoKey);
 
       const today = new Date().toISOString().slice(0, 10);
       const countKey = `ytcount:${today}`;
@@ -717,7 +778,6 @@ This bot only responds to your authorized Telegram accounts.
     }
 
     const [removed] = queue.splice(index, 1);
-    await env.STATE.delete(removed.videoKey);
     repackQueue(env, queue);
     await saveQueue(env, queue);
 
@@ -726,10 +786,6 @@ This bot only responds to your authorized Telegram accounts.
   }
 
   if (message.text === "/clearqueue") {
-    const queue = await getQueue(env);
-    for (const item of queue) {
-      await env.STATE.delete(item.videoKey);
-    }
     await saveQueue(env, []);
     await tgSend(env, chatId, "🗑️ Queue cleared completely.");
     return;
@@ -758,48 +814,23 @@ This bot only responds to your authorized Telegram accounts.
       tokenStatus = `❌ ${err.message}`;
     }
 
-    const currentStorage = queue.reduce((acc, item) => acc + (item.fileSize || (20 * 1024 * 1024)), 0);
-    const usedMb = (currentStorage / (1024 * 1024)).toFixed(1);
-    const maxMb = 800;
-
-    const avgSize = queue.length > 0 ? currentStorage / queue.length : 20 * 1024 * 1024;
-    const remainingStorageBytes = Math.max(0, (maxMb * 1024 * 1024) - currentStorage);
-    const remainingByStorage = Math.floor(remainingStorageBytes / avgSize);
-
     const MAX_TTL_MS = 28 * 24 * 60 * 60 * 1000;
     const now = Date.now();
     const autoCount = queue.filter((it) => !(it.manual && it.scheduledAt)).length;
     const blockedTimes = queue.filter((it) => it.manual && it.scheduledAt).map((it) => it.scheduledAt);
-    const remainingBySchedule = countAutoSlotsWithin(env, autoCount, blockedTimes, now + MAX_TTL_MS);
-
-    let bottleneck = "";
-    let maxAllowedNew = 0;
-
-    if (remainingBySchedule < remainingByStorage) {
-      bottleneck = "28-Day Expiration Schedule Window";
-      maxAllowedNew = remainingBySchedule;
-    } else if (remainingByStorage < remainingBySchedule) {
-      bottleneck = "KV Storage Capacity Limit (800MB)";
-      maxAllowedNew = remainingByStorage;
-    } else {
-      bottleneck = "KV Storage & 28-Day Expiration Window";
-      maxAllowedNew = remainingByStorage;
-    }
-
-    const avgMbStr = (avgSize / (1024 * 1024)).toFixed(1);
+    const maxAllowedNew = countAutoSlotsWithin(env, autoCount, blockedTimes, now + MAX_TTL_MS);
 
     const statusText = `📊 <b>Bot Status</b>
 
 📋 Queue: ${queue.length} video(s)
-💾 KV Storage: ${usedMb}MB / ${maxMb}MB used (avg ${avgMbStr}MB/video)
 📅 Today's uploads: ${count}/${maxPerDay}
 🕒 Last upload: ${lastUploadAt ? formatReadable(lastUploadAt, timeZone) : "never"}
 ⏸️ Paused: ${paused ? `yes (${paused})` : "no"}
 🔑 YouTube token: ${tokenStatus}
 
-🚦 <b>Capacity & Bottleneck</b>
+🚦 <b>Capacity</b>
 ➕ Max new videos allowed: <b>${maxAllowedNew}</b>
-⚠️ Current Bottleneck: <b>${bottleneck}</b>`;
+⚠️ Limited by: <b>28-day scheduling window</b>`;
 
     await tgSend(env, chatId, statusText);
     return;
@@ -868,7 +899,8 @@ This bot only responds to your authorized Telegram accounts.
         `pending:${chatId}`,
         JSON.stringify({
           step: "awaiting_ai_choice",
-          r2Key: pending.r2Key,
+          fileId: pending.fileId,
+          fileUniqueId: pending.fileUniqueId,
           originalText: message.text.trim(),
           fileSize: pending.fileSize || 0,
         })
@@ -911,7 +943,8 @@ This bot only responds to your authorized Telegram accounts.
         `pending:${chatId}`,
         JSON.stringify({
             step: "awaiting_ai_choice",
-            r2Key: pending.r2Key,
+            fileId: pending.fileId,
+            fileUniqueId: pending.fileUniqueId,
             originalText: pending.originalText,
             fileSize: pending.fileSize || 0,
         })
@@ -946,7 +979,7 @@ const cleanedInput = cleanCaption(message.text);
 
 const meta = await generateMetadata(env, cleanedInput);
 
-    await env.STATE.put(`draft:${chatId}`, JSON.stringify({ ...meta, originalText: cleanedInput, r2Key: pending.r2Key }));
+    await env.STATE.put(`draft:${chatId}`, JSON.stringify({ ...meta, originalText: cleanedInput, fileId: pending.fileId, fileUniqueId: pending.fileUniqueId, fileSize: pending.fileSize || 0 }));
     await env.STATE.put(`pending:${chatId}`, JSON.stringify({ step: "awaiting_confirmation" }));
 
     const hashtags = meta.hashtags.map((h) => `#${h.replace(/^#/, "")}`).join(" ");
@@ -964,62 +997,53 @@ const meta = await generateMetadata(env, cleanedInput);
   }
 }
 
-// async function handleCallback(cq, env) {
-//   const chatId = cq.message.chat.id;
-//   const userId = cq.from.id.toString();
-//   if (userId !== env.MY_TELEGRAM_USER_ID) return;
-
-//   await tgAnswerCallback(env, cq.id, "Processing...");
-
-//   const draftRaw = await env.STATE.get(`draft:${chatId}`);
-//   if (!draftRaw) {
-//     await tgEditMessage(env, chatId, cq.message.message_id, "This request expired, please resend the video.");
-//     return;
-//   }
-//   const draft = JSON.parse(draftRaw);
-
-//   const today = new Date().toISOString().slice(0, 10);
-//   const countKey = `ytcount:${today}`;
-//   const count = parseInt((await env.STATE.get(countKey)) || "0", 10);
-//   if (count >= DAILY_UPLOAD_LIMIT) {
-//     await tgEditMessage(env, chatId, cq.message.message_id, "🚫 Daily YouTube upload quota reached. Try again tomorrow.");
-//     return;
-//   }
-
-//   let title, description, tags;
-//   if (cq.data === "accept") {
-//     ({ title, description, hashtags: tags } = draft);
-//   } else {
-//     title = draft.originalText.slice(0, 100);
-//     description = "";
-//     tags = [];
-//   }
-
-//   await tgEditMessage(env, chatId, cq.message.message_id, "⏫ Uploading to YouTube...");
-
-//   const videoBytes = await env.STATE.get(draft.r2Key, "arrayBuffer");
-//   if (!videoBytes) {
-//     await tgEditMessage(env, chatId, cq.message.message_id, "⚠️ Video expired from storage, please resend it.");
-//     return;
-//   }
-
-//   try {
-//     const videoId = await uploadShort(env, videoBytes, { title, description, tags });
-//     await env.STATE.put(countKey, (count + 1).toString(), { expirationTtl: 60 * 60 * 26 });
-//     await env.STATE.delete(draft.r2Key);
-//     await env.STATE.delete(`draft:${chatId}`);
-//     await env.STATE.delete(`pending:${chatId}`);
-//     await tgEditMessage(env, chatId, cq.message.message_id, `✅ Uploaded! https://youtu.be/${videoId}`);
-//   } catch (err) {
-//     await tgEditMessage(env, chatId, cq.message.message_id, "❌ Upload failed: " + err.message);
-//   }
-// }
-
-
 async function handleCallback(cq, env) {
   const chatId = cq.message.chat.id;
   const userId = cq.from.id.toString();
   if (!isAuthorized(env, userId)) return;
+
+  if (cq.data.startsWith("qp:")) {
+    const page = parseInt(cq.data.split(":")[1], 10) || 1;
+    await tgAnswerCallback(env, cq.id, "");
+    const paused = await env.STATE.get("queuePaused");
+    const pausedNote = paused ? `⏸️ Queue is currently PAUSED (${paused}). Auto-resumes 24h after your last upload, or send /resumequeue now.\n\n` : "";
+    const queue = await getQueue(env);
+    if (queue.length === 0) {
+      await tgEditMessage(env, chatId, cq.message.message_id, `${pausedNote}📋 Queue is empty.`);
+      return;
+    }
+    const { text, keyboard } = renderQueuePage(env, queue, page, pausedNote);
+    await tgEditMessage(env, chatId, cq.message.message_id, text, keyboard.inline_keyboard[0].length ? keyboard : undefined);
+    return;
+  }
+
+  if (cq.data === "dupe_confirm" || cq.data === "dupe_cancel") {
+    const pendingRaw = await env.STATE.get(`pending:${chatId}`);
+    if (!pendingRaw) {
+      await tgAnswerCallback(env, cq.id, "Expired");
+      return;
+    }
+    const pending = JSON.parse(pendingRaw);
+    if (pending.step !== "awaiting_dupe_confirmation") {
+      await tgAnswerCallback(env, cq.id, "Expired");
+      return;
+    }
+    if (cq.data === "dupe_cancel") {
+      await env.STATE.delete(`pending:${chatId}`);
+      await tgAnswerCallback(env, cq.id, "Cancelled");
+      await tgEditMessage(env, chatId, cq.message.message_id, "❌ Cancelled — the duplicate video was not queued.");
+      return;
+    }
+    await tgAnswerCallback(env, cq.id, "OK");
+    await tgEditMessage(env, chatId, cq.message.message_id, "✅ Continuing with the duplicate.");
+    await beginIntake(env, chatId, {
+      fileId: pending.fileId,
+      fileUniqueId: pending.fileUniqueId,
+      caption: pending.caption || "",
+      fileSize: pending.fileSize || 0,
+    });
+    return;
+  }
 
   if (cq.data.startsWith("et:") || cq.data.startsWith("ed:") || cq.data.startsWith("eh:")) {
     const [prefix, itemId] = cq.data.split(":");
@@ -1057,7 +1081,8 @@ async function handleCallback(cq, env) {
     `pending:${chatId}`,
     JSON.stringify({
       step: "awaiting_ai_choice",
-      r2Key: pending.r2Key,
+      fileId: pending.fileId,
+      fileUniqueId: pending.fileUniqueId,
       originalText: pending.originalText,
       fileSize: pending.fileSize || 0,
     })
@@ -1099,7 +1124,8 @@ await env.STATE.put(
     `pending:${chatId}`,
     JSON.stringify({
         step: "editing_caption_title",
-        r2Key: pending.r2Key,
+        fileId: pending.fileId,
+        fileUniqueId: pending.fileUniqueId,
         originalText: pending.originalText,
         fileSize: pending.fileSize || 0,
     })
@@ -1140,7 +1166,8 @@ if (cq.data === "generate_ai" || cq.data === "use_raw_title") {
     JSON.stringify({
       ...meta,
       originalText: pending.originalText,
-      r2Key: pending.r2Key,
+      fileId: pending.fileId,
+      fileUniqueId: pending.fileUniqueId,
       fileSize: pending.fileSize || 0,
     })
   );
@@ -1204,21 +1231,17 @@ if (cq.data === "accept" || cq.data === "generate_ai") {
   return;
 }
 
-  const videoBytes = await env.STATE.get(draft.r2Key, "arrayBuffer");
-  if (!videoBytes) {
-    await tgEditMessage(env, chatId, cq.message.message_id, "⚠️ Video expired from storage, please resend it.");
+  if (!draft.fileId) {
+    await tgEditMessage(env, chatId, cq.message.message_id, "⚠️ Lost track of that video, please resend it.");
     return;
   }
 
   const queueId = `${chatId}-${Date.now()}`;
-  const queueVideoKey = `queuevideo:${queueId}`;
-  await env.STATE.put(queueVideoKey, videoBytes, { expirationTtl: 60 * 60 * 24 * 30 }); // 30 days
-  await env.STATE.delete(draft.r2Key);
   await env.STATE.delete(`draft:${chatId}`);
   await env.STATE.delete(`pending:${chatId}`);
 
   const queue = await getQueue(env);
-  const newItem = { id: queueId, videoKey: queueVideoKey, title, description, hashtags: tags, chatId, fileSize: draft.fileSize || 0 };
+  const newItem = { id: queueId, fileId: draft.fileId, fileUniqueId: draft.fileUniqueId, title, description, hashtags: tags, chatId, fileSize: draft.fileSize || 0 };
   queue.push(newItem);
   repackQueue(env, queue);
   await saveQueue(env, queue);
