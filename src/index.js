@@ -11,6 +11,35 @@ const FILTER_WORDS = new Set([
 const TITLE_SUFFIX = " #shorts #persian #فارسی";
 const MAX_TITLE_LENGTH = 100;
 
+// Single source of truth for the Telegram "/" command menu — edit this list
+// and it propagates automatically (see ensureCommandsRegistered below), no
+// manual BotFather step and no need to send /help after a deploy.
+const BOT_COMMANDS = [
+  { command: "queue", description: "See all queued videos and schedule" },
+  { command: "logs", description: "See recent activity (/logs errors to filter)" },
+  { command: "history", description: "Full timeline for one video by ID" },
+  { command: "status", description: "Check bot health, capacity, and limits" },
+  { command: "preview", description: "See full metadata for a queued video" },
+  { command: "posted", description: "See the last 10 posted videos" },
+  { command: "remove", description: "Delete one video from the queue" },
+  { command: "postnow", description: "Upload a queued video immediately" },
+  { command: "setschedule", description: "Set a custom date/time for a video" },
+  { command: "resumequeue", description: "Resume queue after being paused" },
+  { command: "clearqueue", description: "Wipe the entire queue" },
+  { command: "help", description: "Show instructions" },
+];
+
+// Registers BOT_COMMANDS with Telegram only when the list has actually
+// changed since last time (hash stored in KV), so this is safe to call on
+// every webhook request without spamming the setMyCommands API.
+async function ensureCommandsRegistered(env) {
+  const desiredHash = String(hashStr(JSON.stringify(BOT_COMMANDS)));
+  const storedHash = await env.STATE.get("botCommandsHash");
+  if (storedHash === desiredHash) return;
+  await tgSetCommands(env, BOT_COMMANDS);
+  await env.STATE.put("botCommandsHash", desiredHash);
+}
+
 // Derive the posting schedule from wrangler.jsonc vars so editing config actually
 // moves both /status and the scheduler. Slots are evenly spaced: the first atimport { generateMetadata, validateAIMetadata } from "./ai.js";
 
@@ -591,6 +620,12 @@ export default {
       return new Response("forbidden", { status: 403 });
     }
 
+    try {
+      await ensureCommandsRegistered(env);
+    } catch (err) {
+      console.error("ensureCommandsRegistered failed:", err.message);
+    }
+
     const update = await request.json();
     try {
       if (update.message) await handleMessage(update.message, env);
@@ -891,21 +926,7 @@ This bot only responds to your authorized Telegram accounts.
 
     await tgSend(env, chatId, helpText);
 
-    await tgSetCommands(env, [
-      { command: "queue", description: "See all queued videos and schedule" },
-      { command: "logs", description: "See recent activity (/logs errors to filter)" },
-      { command: "history", description: "Full timeline for one video by ID" },
-      { command: "status", description: "Check bot health, capacity, and limits" },
-      { command: "preview", description: "See full metadata for a queued video" },
-      { command: "posted", description: "See the last 10 posted videos" },
-      { command: "remove", description: "Delete one video from the queue" },
-      { command: "postnow", description: "Upload a queued video immediately" },
-      { command: "setschedule", description: "Set a custom date/time for a video" },
-      { command: "defaultschedule", description: "Reset all videos to the default auto-schedule" },
-      { command: "resumequeue", description: "Resume queue after being paused" },
-      { command: "clearqueue", description: "Wipe the entire queue" },
-      { command: "help", description: "Show instructions" }
-    ]);
+    await tgSetCommands(env, BOT_COMMANDS);
     return;
   }
 
