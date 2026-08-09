@@ -120,60 +120,97 @@ function parseLocalDateTime(dateStr, timeStr, timeZone) {
   return guess;
 }
 
-async function computeScheduleTimes(env, queueItems) {
+const SLOT_GRID_MS = 15 * 60 * 1000; // 15-minute posting grid (matches the */15 cron)
+
+function hashStr(s) {
+  let hash = 0;
+  for (let i = 0; i < s.length; i++) {
+    hash = (Math.imul(31, hash) + s.charCodeAt(i)) | 0;
+  }
+  return hash;
+}
+
+// Absolute ms for a given local day + window index, snapped to the 15-min grid.
+// Depends only on the day and window (not the video), so a slot is a stable
+// anchor: whichever video fills it lands on the exact same time.
+function slotTimeFor(dayStr, dayMidnightMs, windowIndex) {
+  const win = UPLOAD_SCHEDULE.windows[windowIndex];
+  const [startH, startM] = win.start.split(":").map(Number);
+  const [endH, endM] = win.end.split(":").map(Number);
+  const startMs = dayMidnightMs + (startH * 60 + startM) * 60000;
+  const endMs = dayMidnightMs + (endH * 60 + endM) * 60000;
+  const randomDec = Math.abs(Math.sin(hashStr(dayStr + windowIndex) || 1));
+  const raw = startMs + Math.floor(randomDec * (endMs - startMs));
+  const snapped = Math.floor(raw / SLOT_GRID_MS) * SLOT_GRID_MS;
+  return Math.max(startMs, snapped);
+}
+
+// The next `count` auto-slot times at or after `startMs`, skipping any 15-min
+// bucket already taken by a blocked (manually scheduled) time.
+function generateAutoSlots(env, startMs, count, blockedTimes = []) {
   const timeZone = env.DISPLAY_TIMEZONE || "UTC";
-  const now = Date.now();
-  let currentDayStr = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(now));
-
-  const utcToday = new Date(now).toISOString().slice(0, 10);
-  const usedTodayCount = parseInt((await env.STATE.get(`ytcount:${utcToday}`)) || "0", 10);
-
-  let currentDayMidnight = parseLocalDateTime(currentDayStr, "00:00", timeZone);
-  let windowIndex = usedTodayCount;
-  let cursor = now;
+  const fmt = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" });
+  const taken = new Set(blockedTimes.map((t) => Math.floor(t / SLOT_GRID_MS)));
   const times = [];
+  if (count <= 0) return times;
 
-  for (const item of queueItems) {
-    if (item.manualScheduledAt) {
-      const mTime = Math.max(item.manualScheduledAt, cursor);
-      times.push(mTime);
-      cursor = mTime + 1;
-      continue;
+  let dayStr = fmt.format(new Date(startMs));
+  let dayMidnight = parseLocalDateTime(dayStr, "00:00", timeZone);
+
+  for (let day = 0; day < 3700 && times.length < count; day++) { // ~10yr safety guard
+    for (let w = 0; w < UPLOAD_SCHEDULE.windows.length && times.length < count; w++) {
+      const t = slotTimeFor(dayStr, dayMidnight, w);
+      if (t < startMs) continue;
+      const bucket = Math.floor(t / SLOT_GRID_MS);
+      if (taken.has(bucket)) continue;
+      taken.add(bucket);
+      times.push(t);
     }
-
-    while (true) {
-      if (windowIndex >= UPLOAD_SCHEDULE.windows.length) {
-        currentDayMidnight += 24 * 60 * 60 * 1000;
-        currentDayStr = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(currentDayMidnight));
-        currentDayMidnight = parseLocalDateTime(currentDayStr, "00:00", timeZone);
-        windowIndex = 0;
-      }
-
-      const win = UPLOAD_SCHEDULE.windows[windowIndex];
-      const [startH, startM] = win.start.split(":").map(Number);
-      const [endH, endM] = win.end.split(":").map(Number);
-      const startMs = currentDayMidnight + ((startH * 60 + startM) * 60000);
-      const endMs = currentDayMidnight + ((endH * 60 + endM) * 60000);
-
-      let hash = 0;
-      const seedStr = item.id + currentDayStr + windowIndex;
-      for (let i = 0; i < seedStr.length; i++) {
-        hash = (Math.imul(31, hash) + seedStr.charCodeAt(i)) | 0;
-      }
-      const randomDec = Math.abs(Math.sin(hash || 1));
-      const randomMs = startMs + Math.floor(randomDec * (endMs - startMs));
-
-      if (randomMs > cursor) {
-        times.push(randomMs);
-        cursor = randomMs + 1;
-        windowIndex++;
-        break;
-      } else {
-        windowIndex++;
-      }
-    }
+    dayMidnight += 24 * 60 * 60 * 1000;
+    dayStr = fmt.format(new Date(dayMidnight));
+    dayMidnight = parseLocalDateTime(dayStr, "00:00", timeZone);
   }
   return times;
+}
+
+// Assign each video a persisted scheduledAt: manual items keep theirs, auto items
+// (in queue order) take the earliest free slots from now on. Then sort so array
+// order matches time order (the cron always posts queue[0]). Mutates queue.
+function repackQueue(env, queue) {
+  const now = Date.now();
+
+  for (const item of queue) {
+    // migrate the old field name if present
+    if (item.manualScheduledAt && !item.scheduledAt) {
+      item.scheduledAt = item.manualScheduledAt;
+      item.manual = true;
+      delete item.manualScheduledAt;
+    }
+  }
+
+  const isManual = (it) => it.manual && it.scheduledAt;
+  const blocked = queue.filter(isManual).map((it) => it.scheduledAt);
+  const autoItems = queue.filter((it) => !isManual(it));
+  const slots = generateAutoSlots(env, now, autoItems.length, blocked);
+  autoItems.forEach((it, i) => {
+    it.scheduledAt = slots[i];
+  });
+
+  queue.sort((a, b) => a.scheduledAt - b.scheduledAt);
+  return queue;
+}
+
+// How many additional auto videos would still fit before a cutoff (used by
+// /status and the accept-video guard to reason about the 28-day KV expiry).
+function countAutoSlotsWithin(env, existingAutoCount, blockedTimes, cutoffMs) {
+  const probeAhead = 120; // 28 days * 3/day ≈ 84; 120 is a safe ceiling
+  const slots = generateAutoSlots(env, Date.now(), existingAutoCount + probeAhead, blockedTimes);
+  let n = 0;
+  for (let i = existingAutoCount; i < slots.length; i++) {
+    if (slots[i] > cutoffMs) break;
+    n++;
+  }
+  return n;
 }
 
 function isQuotaError(message) {
@@ -275,15 +312,18 @@ async function processQueueTick(env) {
     return;
   }
 
-  const scheduleTimes = await computeScheduleTimes(env, queue);
-  const nextTime = scheduleTimes[0];
-
-  if (Date.now() < nextTime) {
-    console.log("Not time to post yet.");
-    return;
+  // Assign times to any legacy items that predate persisted scheduling.
+  if (queue.some((q) => !q.scheduledAt)) {
+    repackQueue(env, queue);
+    await saveQueue(env, queue);
   }
 
   const item = queue[0];
+
+  if (Date.now() < item.scheduledAt) {
+    console.log("Not time to post yet.");
+    return;
+  }
   const today = new Date().toISOString().slice(0, 10);
   const countKey = `ytcount:${today}`;
   const count = parseInt((await env.STATE.get(countKey)) || "0", 10);
@@ -304,6 +344,7 @@ async function processQueueTick(env) {
     });
 
     queue.shift();
+    repackQueue(env, queue);
     await saveQueue(env, queue);
     await env.STATE.delete(item.videoKey);
     await env.STATE.put(countKey, (count + 1).toString(), { expirationTtl: 60 * 60 * 26 });
@@ -330,13 +371,19 @@ async function processQueueTick(env) {
 
     item.failCount = (item.failCount || 0) + 1;
     if (item.failCount >= 2) {
+      // Drop its slot and re-queue as an auto item so it gets the latest slot,
+      // freeing the front for videos behind it instead of blocking them.
       queue.shift();
+      item.manual = false;
+      item.scheduledAt = undefined;
       queue.push(item);
+      repackQueue(env, queue);
       await saveQueue(env, queue);
+      const newPos = queue.findIndex((q) => q.id === item.id) + 1;
       await tgSend(
         env,
         item.chatId,
-        `❌ Upload failed twice for "${item.title}": ${err.message}\n↩️ Moved to the back of the queue (position ${queue.length}) so it doesn't block other videos. I'll retry it again later.`
+        `❌ Upload failed twice for "${item.title}": ${err.message}\n↩️ Moved to the back of the queue (position ${newPos}) so it doesn't block other videos. I'll retry it again later.`
       );
     } else {
       await saveQueue(env, queue);
@@ -376,9 +423,10 @@ async function handleMessage(message, env) {
       return;
     }
 
-    const mockItem = { id: "temp-check" };
-    const simulatedTimes = await computeScheduleTimes(env, [...queue, mockItem]);
-    const projectedTime = simulatedTimes[simulatedTimes.length - 1];
+    const autoCount = queue.filter((it) => !(it.manual && it.scheduledAt)).length;
+    const blockedTimes = queue.filter((it) => it.manual && it.scheduledAt).map((it) => it.scheduledAt);
+    const projectedSlots = generateAutoSlots(env, Date.now(), autoCount + 1, blockedTimes);
+    const projectedTime = projectedSlots[projectedSlots.length - 1];
     const MAX_TTL_MS = 28 * 24 * 60 * 60 * 1000;
 
     if (projectedTime - Date.now() > MAX_TTL_MS) {
@@ -486,7 +534,7 @@ Just send a video (under 20MB). I'll ask what it's about, generate a Persian tit
 /posted — see the last 10 videos actually posted to YouTube, with live view counts
 
 <b>How scheduling works:</b>
-Videos auto-post at most ${UPLOAD_SCHEDULE.uploadsPerDay} per day. They are randomly assigned an exact minute within specific configured windows. The bot strictly limits your queue to prevent KV storage overflow (800MB cap) and prevents any queued videos from expiring before uploading (28-day window).
+Videos auto-post at most ${UPLOAD_SCHEDULE.uploadsPerDay} per day, each locked to a fixed time slot (shown in /queue) that never drifts. If you /postnow or /remove a video, the ones behind it move UP to fill the freed slots — nobody's time slides later. Use /setschedule to pin a video to your own time. The bot limits your queue to prevent KV storage overflow (800MB cap) and stops videos expiring before upload (28-day window).
 
 <b>Access:</b>
 This bot only responds to your authorized Telegram accounts.
@@ -518,12 +566,16 @@ This bot only responds to your authorized Telegram accounts.
       await tgSend(env, chatId, `${pausedNote}📋 Queue is empty.`);
     } else {
       const timeZone = env.DISPLAY_TIMEZONE || "UTC";
-      const scheduleTimes = await computeScheduleTimes(env, queue);
+      // Assign times to any legacy items that predate persisted scheduling.
+      if (queue.some((q) => !q.scheduledAt)) {
+        repackQueue(env, queue);
+        await saveQueue(env, queue);
+      }
       const list = queue
         .map((q, i) => {
           const sizeMb = ((q.fileSize || (20 * 1024 * 1024)) / (1024 * 1024)).toFixed(1);
           const shortTitle = q.title.length > 40 ? q.title.substring(0, 37) + "..." : q.title;
-          return `<b>${i + 1}.</b> ${escapeHtml(shortTitle)}\n   └ 🕒 ${formatReadable(scheduleTimes[i], timeZone)} · 📁 ${sizeMb}MB`;
+          return `<b>${i + 1}.</b> ${escapeHtml(shortTitle)}\n   └ 🕒 ${formatReadable(q.scheduledAt, timeZone)} · 📁 ${sizeMb}MB`;
         })
         .join("\n\n");
       await tgSend(
@@ -562,20 +614,24 @@ This bot only responds to your authorized Telegram accounts.
       return;
     }
 
-    queue[index].manualScheduledAt = targetMs;
+    const item = queue[index];
+    // Snap up to the next 15-min grid tick so the shown time is exactly when it posts.
+    item.manual = true;
+    item.scheduledAt = Math.ceil(targetMs / SLOT_GRID_MS) * SLOT_GRID_MS;
+    delete item.manualScheduledAt;
+    repackQueue(env, queue);
     await saveQueue(env, queue);
 
-    const scheduleTimes = await computeScheduleTimes(env, queue);
-    const actualTime = scheduleTimes[index];
+    const actualTime = item.scheduledAt;
     const adjustedNote =
       Math.abs(actualTime - targetMs) > 60000
-        ? `\n\n⚠️ Adjusted automatically — it'll actually go out at ${formatReadable(actualTime, timeZone)}.`
+        ? `\n\n⚠️ Adjusted to the nearest 15-minute slot — it'll go out at ${formatReadable(actualTime, timeZone)}.`
         : "";
 
     await tgSend(
       env,
       chatId,
-      `🗓️ Requested time for "${escapeHtml(queue[index].title)}": ${formatReadable(targetMs, timeZone)}.${adjustedNote}\n\nSend /queue to see the full updated schedule.`
+      `🗓️ Requested time for "${escapeHtml(item.title)}": ${formatReadable(targetMs, timeZone)}.${adjustedNote}\n\nSend /queue to see the full updated schedule.`
     );
     return;
   }
@@ -627,6 +683,7 @@ This bot only responds to your authorized Telegram accounts.
       });
 
       queue.splice(index, 1);
+      repackQueue(env, queue);
       await saveQueue(env, queue);
       await env.STATE.delete(item.videoKey);
 
@@ -661,6 +718,7 @@ This bot only responds to your authorized Telegram accounts.
 
     const [removed] = queue.splice(index, 1);
     await env.STATE.delete(removed.videoKey);
+    repackQueue(env, queue);
     await saveQueue(env, queue);
 
     await tgSend(env, chatId, `🗑️ Removed "${escapeHtml(removed.title)}" from the queue. ${queue.length} left.`);
@@ -708,19 +766,11 @@ This bot only responds to your authorized Telegram accounts.
     const remainingStorageBytes = Math.max(0, (maxMb * 1024 * 1024) - currentStorage);
     const remainingByStorage = Math.floor(remainingStorageBytes / avgSize);
 
-    let remainingBySchedule = 0;
     const MAX_TTL_MS = 28 * 24 * 60 * 60 * 1000;
     const now = Date.now();
-    let testQueue = [...queue];
-
-    while (true) {
-      testQueue.push({ id: `test-${testQueue.length}` });
-      const times = await computeScheduleTimes(env, testQueue);
-      if (times[times.length - 1] - now > MAX_TTL_MS) {
-        break;
-      }
-      remainingBySchedule++;
-    }
+    const autoCount = queue.filter((it) => !(it.manual && it.scheduledAt)).length;
+    const blockedTimes = queue.filter((it) => it.manual && it.scheduledAt).map((it) => it.scheduledAt);
+    const remainingBySchedule = countAutoSlotsWithin(env, autoCount, blockedTimes, now + MAX_TTL_MS);
 
     let bottleneck = "";
     let maxAllowedNew = 0;
@@ -1168,13 +1218,17 @@ if (cq.data === "accept" || cq.data === "generate_ai") {
   await env.STATE.delete(`pending:${chatId}`);
 
   const queue = await getQueue(env);
-  queue.push({ id: queueId, videoKey: queueVideoKey, title, description, hashtags: tags, chatId, fileSize: draft.fileSize || 0 });
+  const newItem = { id: queueId, videoKey: queueVideoKey, title, description, hashtags: tags, chatId, fileSize: draft.fileSize || 0 };
+  queue.push(newItem);
+  repackQueue(env, queue);
   await saveQueue(env, queue);
 
+  const position = queue.findIndex((q) => q.id === queueId) + 1;
+  const timeZone = env.DISPLAY_TIMEZONE || "UTC";
   await tgEditMessage(
     env,
     chatId,
     cq.message.message_id,
-    `📋 Added to queue at position ${queue.length}. I'll space it out automatically and message you the link once it's live.`
+    `📋 Added to queue at position ${position}, scheduled for ${formatReadable(newItem.scheduledAt, timeZone)}. I'll post it at that time and message you the link once it's live.`
   );
 }
