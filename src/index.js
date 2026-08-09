@@ -11,14 +11,31 @@ const FILTER_WORDS = new Set([
 const TITLE_SUFFIX = " #shorts #persian #فارسی";
 const MAX_TITLE_LENGTH = 100;
 
-const UPLOAD_SCHEDULE = {
-  uploadsPerDay: 3,
-  windows: [
-    { start: "14:00", end: "15:00" },
-    { start: "18:00", end: "20:00" },
-    { start: "21:00", end: "23:00" },
-  ],
-};
+// Derive the posting schedule from wrangler.jsonc vars so editing config actually
+// moves both /status and the scheduler. Slots are evenly spaced: the first at
+// POSTING_WINDOW_START_HOUR, each MIN_HOURS_BETWEEN_UPLOADS apart, MAX_UPLOADS_PER_DAY
+// of them. Offsets are minutes-from-midnight and may exceed 1440 (past-midnight slots).
+function getSchedule(env) {
+  const perDay = Math.max(1, parseInt(env.MAX_UPLOADS_PER_DAY || "3", 10));
+  const gapMin = Math.round(Math.max(0, parseFloat(env.MIN_HOURS_BETWEEN_UPLOADS || "4")) * 60);
+  const startMin = Math.round(Math.max(0, parseFloat(env.POSTING_WINDOW_START_HOUR || "14")) * 60);
+  const endHour = parseFloat(env.POSTING_WINDOW_END_HOUR ?? "23");
+  const windowLenMin = (((Math.round(endHour * 60) - startMin) % 1440) + 1440) % 1440 || 1440;
+  // Organic jitter up to 1h, but always shorter than the gap so windows never overlap.
+  const jitterMin = Math.min(60, Math.max(0, gapMin - 15));
+  const windows = [];
+  for (let i = 0; i < perDay; i++) {
+    const off = startMin + i * gapMin;
+    windows.push({ startOffsetMin: off, endOffsetMin: off + jitterMin });
+  }
+  const lastOffset = (perDay - 1) * gapMin;
+  return { uploadsPerDay: perDay, windows, startMin, gapMin, windowLenMin, fits: lastOffset <= windowLenMin };
+}
+
+function offsetToClock(offMin) {
+  const m = (((Math.round(offMin) % 1440) + 1440) % 1440);
+  return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+}
 
 function cleanCaption(text = "") {
   let cleaned = text;
@@ -132,14 +149,13 @@ function hashStr(s) {
 
 // Absolute ms for a given local day + window index, snapped to the 15-min grid.
 // Depends only on the day and window (not the video), so a slot is a stable
-// anchor: whichever video fills it lands on the exact same time.
-function slotTimeFor(dayStr, dayMidnightMs, windowIndex) {
-  const win = UPLOAD_SCHEDULE.windows[windowIndex];
-  const [startH, startM] = win.start.split(":").map(Number);
-  const [endH, endM] = win.end.split(":").map(Number);
-  const startMs = dayMidnightMs + (startH * 60 + startM) * 60000;
-  const endMs = dayMidnightMs + (endH * 60 + endM) * 60000;
-  const randomDec = Math.abs(Math.sin(hashStr(dayStr + windowIndex) || 1));
+// anchor: whichever video fills it lands on the exact same time. Offsets are
+// minutes from that day's midnight and may exceed 1440 (rolls into next day).
+function slotTimeFor(schedule, dayMidnightMs, windowIndex) {
+  const win = schedule.windows[windowIndex];
+  const startMs = dayMidnightMs + win.startOffsetMin * 60000;
+  const endMs = dayMidnightMs + win.endOffsetMin * 60000;
+  const randomDec = Math.abs(Math.sin(hashStr(String(dayMidnightMs) + windowIndex) || 1));
   const raw = startMs + Math.floor(randomDec * (endMs - startMs));
   const snapped = Math.floor(raw / SLOT_GRID_MS) * SLOT_GRID_MS;
   return Math.max(startMs, snapped);
@@ -149,6 +165,7 @@ function slotTimeFor(dayStr, dayMidnightMs, windowIndex) {
 // bucket already taken by a blocked (manually scheduled) time.
 function generateAutoSlots(env, startMs, count, blockedTimes = []) {
   const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+  const schedule = getSchedule(env);
   const fmt = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" });
   const taken = new Set(blockedTimes.map((t) => Math.floor(t / SLOT_GRID_MS)));
   const times = [];
@@ -158,8 +175,8 @@ function generateAutoSlots(env, startMs, count, blockedTimes = []) {
   let dayMidnight = parseLocalDateTime(dayStr, "00:00", timeZone);
 
   for (let day = 0; day < 3700 && times.length < count; day++) { // ~10yr safety guard
-    for (let w = 0; w < UPLOAD_SCHEDULE.windows.length && times.length < count; w++) {
-      const t = slotTimeFor(dayStr, dayMidnight, w);
+    for (let w = 0; w < schedule.windows.length && times.length < count; w++) {
+      const t = slotTimeFor(schedule, dayMidnight, w);
       if (t < startMs) continue;
       const bucket = Math.floor(t / SLOT_GRID_MS);
       if (taken.has(bucket)) continue;
@@ -198,19 +215,6 @@ function repackQueue(env, queue) {
 
   queue.sort((a, b) => a.scheduledAt - b.scheduledAt);
   return queue;
-}
-
-// How many additional auto videos would still fit before a cutoff (used by
-// /status and the accept-video guard to reason about the 28-day KV expiry).
-function countAutoSlotsWithin(env, existingAutoCount, blockedTimes, cutoffMs) {
-  const probeAhead = 120; // 28 days * 3/day ≈ 84; 120 is a safe ceiling
-  const slots = generateAutoSlots(env, Date.now(), existingAutoCount + probeAhead, blockedTimes);
-  let n = 0;
-  for (let i = existingAutoCount; i < slots.length; i++) {
-    if (slots[i] > cutoffMs) break;
-    n++;
-  }
-  return n;
 }
 
 function isQuotaError(message) {
@@ -510,23 +514,6 @@ async function handleMessage(message, env) {
   if (media) {
     const queue = await getQueue(env);
 
-    const autoCount = queue.filter((it) => !(it.manual && it.scheduledAt)).length;
-    const blockedTimes = queue.filter((it) => it.manual && it.scheduledAt).map((it) => it.scheduledAt);
-    const projectedSlots = generateAutoSlots(env, Date.now(), autoCount + 1, blockedTimes);
-    const projectedTime = projectedSlots[projectedSlots.length - 1];
-    const MAX_TTL_MS = 28 * 24 * 60 * 60 * 1000;
-
-    if (projectedTime - Date.now() > MAX_TTL_MS) {
-      const timeZone = env.DISPLAY_TIMEZONE || "UTC";
-      const dateStr = formatReadable(projectedTime, timeZone);
-      await tgSend(
-        env,
-        chatId,
-        `⚠️ Cannot accept video: Queue schedule window full! This video would post on ${dateStr}, exceeding the 28-day storage life.`
-      );
-      return;
-    }
-
     if (media.file_size && media.file_size > MAX_BYTES) {
       await tgSend(
         env,
@@ -577,6 +564,7 @@ async function handleMessage(message, env) {
   }
 
   if (message.text === "/help" || message.text === "/start") {
+    const helpSchedule = getSchedule(env);
     const helpText = `🤖 <b>Reels → YouTube Bot</b>
 
 <b>Uploading a video:</b>
@@ -589,14 +577,14 @@ Just send a video (under 20MB). I'll ask what it's about, generate a Persian tit
 /remove (position) — delete one video from the queue (e.g. /remove 1)
 /clearqueue — wipe the entire queue
 /resumequeue — resume the queue after it's been auto-paused (e.g. YouTube quota exceeded)
-/status — quick health check (queue capacity, bottlenecks, token)
+/status — detailed health check (queue, uploads, config, KV, token)
 /preview (position) — see full title/description/hashtags for a queued video, with edit buttons
 
 <b>History:</b>
 /posted — see the last 10 videos actually posted to YouTube, with live view counts
 
 <b>How scheduling works:</b>
-Videos auto-post at most ${UPLOAD_SCHEDULE.uploadsPerDay} per day, each locked to a fixed time slot (shown in /queue) that never drifts. If you /postnow or /remove a video, the ones behind it move UP to fill the freed slots — nobody's time slides later. Use /setschedule to pin a video to your own time. The bot limits your queue to a 28-day scheduling window so videos post before their Telegram file reference can expire.
+Videos auto-post at most ${helpSchedule.uploadsPerDay} per day, each locked to a fixed time slot (shown in /queue) that never drifts. If you /postnow or /remove a video, the ones behind it move UP to fill the freed slots — nobody's time slides later. Use /setschedule to pin a video to your own time. There's no queue limit — the queue stores lightweight Telegram pointers, so videos can wait as long as needed.
 
 <b>Access:</b>
 This bot only responds to your authorized Telegram accounts.
@@ -803,7 +791,8 @@ This bot only responds to your authorized Telegram accounts.
     const today = new Date().toISOString().slice(0, 10);
     const countKey = `ytcount:${today}`;
     const count = parseInt((await env.STATE.get(countKey)) || "0", 10);
-    const maxPerDay = UPLOAD_SCHEDULE.uploadsPerDay;
+    const schedule = getSchedule(env);
+    const maxPerDay = schedule.uploadsPerDay;
     const lastUploadAt = parseInt((await env.STATE.get("lastUploadAt")) || "0", 10);
     const timeZone = env.DISPLAY_TIMEZONE || "UTC";
 
@@ -814,23 +803,42 @@ This bot only responds to your authorized Telegram accounts.
       tokenStatus = `❌ ${err.message}`;
     }
 
-    const MAX_TTL_MS = 28 * 24 * 60 * 60 * 1000;
-    const now = Date.now();
+    const postedRaw = await env.STATE.get("postedVideos");
+    const postedCount = postedRaw ? JSON.parse(postedRaw).length : 0;
+
+    // Where the next auto video would land (no cap anymore — pointers don't expire).
     const autoCount = queue.filter((it) => !(it.manual && it.scheduledAt)).length;
     const blockedTimes = queue.filter((it) => it.manual && it.scheduledAt).map((it) => it.scheduledAt);
-    const maxAllowedNew = countAutoSlotsWithin(env, autoCount, blockedTimes, now + MAX_TTL_MS);
+    const projectedSlots = generateAutoSlots(env, Date.now(), autoCount + 1, blockedTimes);
+    const nextSlot = projectedSlots[projectedSlots.length - 1];
+    const lastQueued = queue.length ? queue[queue.length - 1].scheduledAt : null;
+
+    // The "~" times are the earliest end of each window; the real slot jitters later.
+    const slotTimes = schedule.windows.map((w) => offsetToClock(w.startOffsetMin)).join(", ");
+    const gapHrs = (schedule.gapMin / 60).toFixed(schedule.gapMin % 60 ? 1 : 0);
+    const fitNote = schedule.fits ? "" : `\n⚠️ These slots span more than the posting window — later slots roll past ${offsetToClock(schedule.startMin + schedule.windowLenMin)} into the next window.`;
 
     const statusText = `📊 <b>Bot Status</b>
 
-📋 Queue: ${queue.length} video(s)
-📅 Today's uploads: ${count}/${maxPerDay}
+📋 Queue: <b>${queue.length}</b> video(s)
+📅 Today's uploads: <b>${count}/${maxPerDay}</b>
 🕒 Last upload: ${lastUploadAt ? formatReadable(lastUploadAt, timeZone) : "never"}
+🗓️ Queue posts through: ${lastQueued ? formatReadable(lastQueued, timeZone) : "—"}
+⏭️ Next new video would post: ${formatReadable(nextSlot, timeZone)}
 ⏸️ Paused: ${paused ? `yes (${paused})` : "no"}
 🔑 YouTube token: ${tokenStatus}
 
-🚦 <b>Capacity</b>
-➕ Max new videos allowed: <b>${maxAllowedNew}</b>
-⚠️ Limited by: <b>28-day scheduling window</b>`;
+⚙️ <b>Posting config</b> (from wrangler.jsonc)
+• Uploads/day: <b>${maxPerDay}</b>
+• Daily slots (approx): ${slotTimes} (${timeZone})
+• First slot: ${offsetToClock(schedule.startMin)} · spacing: ~${gapHrs}h
+• Privacy: ${env.YT_PRIVACY_STATUS || "public"}${fitNote}
+
+🗄️ <b>Storage (KV)</b>
+• Queue holds lightweight Telegram pointers — no size limit in practice
+• Posted history: ${postedCount} record(s) (capped at 200)
+• Free-tier budget: 1,000 writes/day · 100,000 reads/day
+• Live usage is only visible in the Cloudflare dashboard`;
 
     await tgSend(env, chatId, statusText);
     return;

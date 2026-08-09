@@ -69,10 +69,10 @@
     "crons": ["*/15 * * * *", "0 9 * * 5"]
   },
   "vars": {
-    "MAX_UPLOADS_PER_DAY": "3",
-    "MIN_HOURS_BETWEEN_UPLOADS": "6",
+    "MAX_UPLOADS_PER_DAY": "4",
+    "MIN_HOURS_BETWEEN_UPLOADS": "4.5",
     "DISPLAY_TIMEZONE": "Asia/Kabul",
-    "POSTING_WINDOW_START_HOUR": "13",
+    "POSTING_WINDOW_START_HOUR": "11",
     "POSTING_WINDOW_END_HOUR": "1"
   }
 }
