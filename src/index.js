@@ -416,8 +416,8 @@ function renderQueuePage(env, queue, page, pausedNote) {
   const totalPages = Math.max(1, Math.ceil(queue.length / QUEUE_PAGE_SIZE));
   const safePage = Math.min(Math.max(1, page), totalPages);
   const start = (safePage - 1) * QUEUE_PAGE_SIZE;
-  const list = queue
-    .slice(start, start + QUEUE_PAGE_SIZE)
+  const pageItems = queue.slice(start, start + QUEUE_PAGE_SIZE);
+  const list = pageItems
     .map((q, i) => {
       const sizeMb = ((q.fileSize || (20 * 1024 * 1024)) / (1024 * 1024)).toFixed(1);
       const shortTitle = q.title.length > 40 ? q.title.substring(0, 37) + "..." : q.title;
@@ -426,12 +426,21 @@ function renderQueuePage(env, queue, page, pausedNote) {
     })
     .join("\n\n");
 
-  const row = [];
-  if (safePage > 1) row.push({ text: "◀️ Prev", callback_data: `qp:${safePage - 1}` });
-  if (safePage < totalPages) row.push({ text: "Next ▶️", callback_data: `qp:${safePage + 1}` });
+  // One tappable button per item (its position number) opens a per-item
+  // Remove/Reschedule/Preview menu, so /remove and /setschedule no longer
+  // require cross-referencing a position number by hand. 4 per row.
+  const itemButtons = pageItems.map((q, i) => ({ text: `${start + i + 1}`, callback_data: `qi:${start + i + 1}` }));
+  const itemRows = [];
+  for (let i = 0; i < itemButtons.length; i += 4) {
+    itemRows.push(itemButtons.slice(i, i + 4));
+  }
 
-  const text = `${pausedNote}📋 ${queue.length} video(s) queued (page ${safePage}/${totalPages}):\n\n${list}\n\nTo remove one, send: /remove (position number)\nTo clear everything: /clearqueue`;
-  return { text, keyboard: { inline_keyboard: [row] } };
+  const navRow = [];
+  if (safePage > 1) navRow.push({ text: "◀️ Prev", callback_data: `qp:${safePage - 1}` });
+  if (safePage < totalPages) navRow.push({ text: "Next ▶️", callback_data: `qp:${safePage + 1}` });
+
+  const text = `${pausedNote}📋 ${queue.length} video(s) queued (page ${safePage}/${totalPages}):\n\n${list}\n\nTap a number below to remove, reschedule, or preview that video.\nTo clear everything: /clearqueue`;
+  return { text, keyboard: { inline_keyboard: [...itemRows, ...(navRow.length ? [navRow] : [])] } };
 }
 
 // Log lines are single short lines, so more fit per page than /queue items
@@ -678,6 +687,7 @@ async function processQueueTick(env) {
     const hoursSinceLastUpload = lastUploadAt ? (Date.now() - lastUploadAt) / (1000 * 60 * 60) : 0;
     if (lastUploadAt && hoursSinceLastUpload >= 24) {
       await env.STATE.delete("queuePaused");
+      await env.STATE.delete("lastPausedReminderAt");
       await logEvent(env, "QUEUE_RESUMED", "Queue auto-resumed after 24h", { via: "automatic" });
       const notifyId = (env.MY_TELEGRAM_USER_ID || "").split(",")[0].trim();
       if (notifyId) {
@@ -685,6 +695,18 @@ async function processQueueTick(env) {
       }
     } else {
       console.log("Queue is paused:", paused);
+      // Periodic nudge every 6h so a paused queue doesn't go unnoticed for
+      // hours — separate from the one-time message sent when it first paused.
+      const lastReminderAt = parseInt((await env.STATE.get("lastPausedReminderAt")) || "0", 10);
+      const hoursSinceReminder = lastReminderAt ? (Date.now() - lastReminderAt) / (1000 * 60 * 60) : Infinity;
+      if (hoursSinceReminder >= 6) {
+        const notifyId = (env.MY_TELEGRAM_USER_ID || "").split(",")[0].trim();
+        if (notifyId) {
+          const resumeInHrs = lastUploadAt ? Math.max(0, 24 - hoursSinceLastUpload).toFixed(1) : "?";
+          await tgSend(env, notifyId, `⏸️ Reminder: queue is still paused (${paused}). Auto-resumes in ~${resumeInHrs}h, or send /resumequeue now.`);
+        }
+        await env.STATE.put("lastPausedReminderAt", Date.now().toString());
+      }
       return;
     }
   }
@@ -727,14 +749,14 @@ async function processQueueTick(env) {
       await tgSend(
         env,
         item.chatId,
-        `🗑️ Dropped "${escapeHtml(item.title)}" — the original video is no longer available on Telegram (the file expired or the message was deleted), so it can't be uploaded. Please resend it if you still want it posted.`
+        `🗑️ Dropped "${escapeHtml(item.title)}" — the original video is no longer available on Telegram (the file expired or the message was deleted), so it can't be uploaded. Please resend it if you still want it posted.\n\nRun /history ${item.vid} for the full timeline.`
       );
     } else {
       await saveQueue(env, queue);
       await tgSend(
         env,
         item.chatId,
-        `⚠️ Couldn't fetch "${escapeHtml(item.title)}" from Telegram (attempt ${item.fetchFailCount}/2). Will retry next cycle — if it keeps failing, the original video is probably gone.`
+        `⚠️ Couldn't fetch "${escapeHtml(item.title)}" from Telegram (attempt ${item.fetchFailCount}/2). Will retry next cycle — if it keeps failing, the original video is probably gone.\n\nRun /history ${item.vid} for the full timeline.`
       );
     }
     return;
@@ -774,7 +796,7 @@ async function processQueueTick(env) {
       await tgSend(
         env,
         item.chatId,
-        `🚫 YouTube upload quota exceeded. The queue is now PAUSED.\n\nIt'll auto-resume 24h after your last successful upload, or send /resumequeue to override manually.`
+        `🚫 YouTube upload quota exceeded. The queue is now PAUSED.\n\nIt'll auto-resume 24h after your last successful upload, or send /resumequeue to override manually.\n\nRun /history ${item.vid} for this video's timeline.`
       );
       return;
     }
@@ -794,14 +816,14 @@ async function processQueueTick(env) {
       await tgSend(
         env,
         item.chatId,
-        `❌ Upload failed twice for "${item.title}": ${err.message}\n↩️ Moved to the back of the queue (position ${newPos}) so it doesn't block other videos. I'll retry it again later.`
+        `❌ Upload failed twice for "${item.title}": ${err.message}\n↩️ Moved to the back of the queue (position ${newPos}) so it doesn't block other videos. I'll retry it again later.\n\nRun /history ${item.vid} for the full timeline.`
       );
     } else {
       await saveQueue(env, queue);
       await tgSend(
         env,
         item.chatId,
-        `❌ Scheduled upload failed for "${item.title}" (attempt ${item.failCount}/2): ${err.message}\nWill retry next cycle.`
+        `❌ Scheduled upload failed for "${item.title}" (attempt ${item.failCount}/2): ${err.message}\nWill retry next cycle.\n\nRun /history ${item.vid} for the full timeline.`
       );
     }
   }
@@ -997,7 +1019,7 @@ This bot only responds to your authorized Telegram accounts.
     const pageArg = parseInt(parts[1], 10);
     const page = isNaN(pageArg) || pageArg < 1 ? 1 : pageArg;
     const { text, keyboard } = renderQueuePage(env, queue, page, pausedNote);
-    await tgSend(env, chatId, text, keyboard.inline_keyboard[0].length ? keyboard : undefined);
+    await tgSend(env, chatId, text, keyboard);
     return;
   }
 
@@ -1161,7 +1183,7 @@ This bot only responds to your authorized Telegram accounts.
       await tgSend(
         env,
         chatId,
-        `❌ Couldn't fetch "${escapeHtml(item.title)}" from Telegram — the original video may be gone (file expired or message deleted). It's still in the queue; resend the video if it's no longer recoverable.`
+        `❌ Couldn't fetch "${escapeHtml(item.title)}" from Telegram — the original video may be gone (file expired or message deleted). It's still in the queue; resend the video if it's no longer recoverable.\n\nRun /history ${item.vid} for the full timeline.`
       );
       return;
     }
@@ -1203,7 +1225,7 @@ This bot only responds to your authorized Telegram accounts.
       } else {
         await logEvent(env, "UPLOAD_FAILED", "Upload failed via /postnow", { vid: item.vid, title: item.title, error: err.message });
       }
-      await tgSend(env, chatId, `❌ Upload failed: ${err.message}\nIt's still in the queue — nothing was removed.`);
+      await tgSend(env, chatId, `❌ Upload failed: ${err.message}\nIt's still in the queue — nothing was removed.\n\nRun /history ${item.vid} for the full timeline.`);
     }
     return;
   }
@@ -1255,6 +1277,7 @@ This bot only responds to your authorized Telegram accounts.
 
   if (message.text === "/resumequeue") {
     await env.STATE.delete("queuePaused");
+    await env.STATE.delete("lastPausedReminderAt");
     await logEvent(env, "QUEUE_RESUMED", "Queue resumed", { via: "manual" });
     await tgSend(env, chatId, "▶️ Queue resumed. It'll try uploading again on the next hourly check.");
     return;
@@ -1476,6 +1499,47 @@ Do you want AI to generate Title + Description + Hashtags?`,
       return;
     }
 
+    if (pending.step === "awaiting_reschedule") {
+      await env.STATE.delete(`pending:${chatId}`);
+      const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+      const [dateStr, timeStr] = message.text.trim().split(/\s+/);
+      const targetMs = parseLocalDateTime(dateStr, timeStr, timeZone);
+      if (!targetMs || isNaN(targetMs)) {
+        await tgSend(env, chatId, "⚠️ Couldn't parse that. Use format: YYYY-MM-DD HH:MM (24-hour). Tap the item's number in /queue to try again.");
+        return;
+      }
+      if (targetMs < Date.now()) {
+        await tgSend(env, chatId, "⚠️ That time is in the past. Pick a future date/time.");
+        return;
+      }
+
+      const queue = await getQueue(env);
+      const item = queue.find((q) => q.id === pending.itemId);
+      if (!item) {
+        await tgSend(env, chatId, "⚠️ That queued item no longer exists, nothing was changed.");
+        return;
+      }
+
+      item.manual = true;
+      item.scheduledAt = Math.ceil(targetMs / SLOT_GRID_MS) * SLOT_GRID_MS;
+      delete item.manualScheduledAt;
+      repackQueue(env, queue);
+      await saveQueue(env, queue);
+
+      const actualTime = item.scheduledAt;
+      const adjustedNote =
+        Math.abs(actualTime - targetMs) > 60000
+          ? `\n\n⚠️ Adjusted to the nearest 15-minute slot — it'll go out at ${formatReadable(actualTime, timeZone)}.`
+          : "";
+
+      await tgSend(
+        env,
+        chatId,
+        `🗓️ Rescheduled "${escapeHtml(item.title)}" to ${formatReadable(targetMs, timeZone)}.${adjustedNote}\n\nSend /queue to see the full updated schedule.`
+      );
+      return;
+    }
+
     if (pending.step !== "awaiting_caption") return;
 
     const cleanedInput = cleanCaption(message.text);
@@ -1516,7 +1580,107 @@ async function handleCallback(cq, env) {
       return;
     }
     const { text, keyboard } = renderQueuePage(env, queue, page, pausedNote);
-    await tgEditMessage(env, chatId, cq.message.message_id, text, keyboard.inline_keyboard[0].length ? keyboard : undefined);
+    await tgEditMessage(env, chatId, cq.message.message_id, text, keyboard);
+    return;
+  }
+
+  if (cq.data.startsWith("qi:")) {
+    const position = parseInt(cq.data.split(":")[1], 10);
+    await tgAnswerCallback(env, cq.id, "");
+    const queue = await getQueue(env);
+    const index = position - 1;
+    if (isNaN(index) || index < 0 || index >= queue.length) {
+      await tgSend(env, chatId, "⚠️ The queue changed since this was shown — please check /queue and try again.");
+      return;
+    }
+    const item = queue[index];
+    const shortTitle = item.title.length > 50 ? item.title.substring(0, 47) + "..." : item.title;
+    await tgSend(
+      env,
+      chatId,
+      `📄 <b>Video #${position}</b>\n${escapeHtml(shortTitle)}\n\nWhat would you like to do?`,
+      {
+        inline_keyboard: [
+          [{ text: "🗑️ Remove", callback_data: `qirm:${position}` }],
+          [{ text: "🗓️ Reschedule", callback_data: `rs:${position}` }],
+          [{ text: "👁️ Preview", callback_data: `pv:${position}` }],
+          [{ text: "❌ Close", callback_data: "qi_close" }],
+        ],
+      }
+    );
+    return;
+  }
+
+  if (cq.data === "qi_close") {
+    await tgAnswerCallback(env, cq.id, "");
+    await tgEditMessage(env, chatId, cq.message.message_id, "Closed.");
+    return;
+  }
+
+  if (cq.data.startsWith("qirm:")) {
+    const position = parseInt(cq.data.split(":")[1], 10);
+    await tgAnswerCallback(env, cq.id, "");
+    const queue = await getQueue(env);
+    const index = position - 1;
+    if (isNaN(index) || index < 0 || index >= queue.length) {
+      await tgEditMessage(env, chatId, cq.message.message_id, "⚠️ The queue changed since this was shown — please check /queue and try again.");
+      return;
+    }
+    const item = queue[index];
+    await tgEditMessage(
+      env,
+      chatId,
+      cq.message.message_id,
+      `⚠️ Remove "${escapeHtml(item.title)}" (position ${position}) from the queue? This can't be undone.`,
+      {
+        inline_keyboard: [[
+          { text: "🗑️ Yes, remove it", callback_data: `rm:${position}:y` },
+          { text: "❌ Cancel", callback_data: `rm:${position}:n` },
+        ]],
+      }
+    );
+    return;
+  }
+
+  if (cq.data.startsWith("pv:")) {
+    const position = parseInt(cq.data.split(":")[1], 10);
+    await tgAnswerCallback(env, cq.id, "");
+    const queue = await getQueue(env);
+    const index = position - 1;
+    if (isNaN(index) || index < 0 || index >= queue.length) {
+      await tgEditMessage(env, chatId, cq.message.message_id, "⚠️ The queue changed since this was shown — please check /queue and try again.");
+      return;
+    }
+    const item = queue[index];
+    const hashtagsText = (item.hashtags || []).map((h) => `#${h.replace(/^#/, "")}`).join(" ");
+    const preview = `<b>Title:</b> ${escapeHtml(item.title)}\n\n<b>Description:</b>\n${escapeHtml(item.description || "(none)")}\n\n<b>Hashtags:</b> ${escapeHtml(hashtagsText || "(none)")}`;
+    await tgEditMessage(env, chatId, cq.message.message_id, preview, {
+      inline_keyboard: [
+        [
+          { text: "✏️ Edit Title", callback_data: `et:${item.id}` },
+          { text: "✏️ Edit Description", callback_data: `ed:${item.id}` },
+          { text: "✏️ Edit Hashtags", callback_data: `eh:${item.id}` },
+        ],
+      ],
+    });
+    return;
+  }
+
+  if (cq.data.startsWith("rs:")) {
+    const position = parseInt(cq.data.split(":")[1], 10);
+    const queue = await getQueue(env);
+    const index = position - 1;
+    if (isNaN(index) || index < 0 || index >= queue.length) {
+      await tgAnswerCallback(env, cq.id, "Queue changed");
+      await tgEditMessage(env, chatId, cq.message.message_id, "⚠️ The queue changed since this was shown — please check /queue and try again.");
+      return;
+    }
+    const item = queue[index];
+    await tgAnswerCallback(env, cq.id, "Reply with new date & time");
+    await env.STATE.put(`pending:${chatId}`, JSON.stringify({ step: "awaiting_reschedule", itemId: item.id }), { expirationTtl: 60 * 30 });
+    await tgSend(env, chatId, `🗓️ Reply with a new date & time for "${escapeHtml(item.title)}" (format: YYYY-MM-DD HH:MM, or /cancel to abort):`, {
+      force_reply: true,
+    });
     return;
   }
 
