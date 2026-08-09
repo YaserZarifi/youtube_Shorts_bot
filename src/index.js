@@ -1062,20 +1062,38 @@ This bot only responds to your authorized Telegram accounts.
       return;
     }
 
-    const [removed] = queue.splice(index, 1);
-    repackQueue(env, queue);
-    await saveQueue(env, queue);
-    await logEvent(env, "QUEUE_REMOVED", "Video removed from queue", { vid: removed.vid, title: removed.title });
-
-    await tgSend(env, chatId, `🗑️ Removed "${escapeHtml(removed.title)}" from the queue. ${queue.length} left.`);
+    const item = queue[index];
+    await tgSend(
+      env,
+      chatId,
+      `⚠️ Remove "${escapeHtml(item.title)}" (position ${index + 1}) from the queue? This can't be undone.`,
+      {
+        inline_keyboard: [[
+          { text: "🗑️ Yes, remove it", callback_data: `rm:${index + 1}:y` },
+          { text: "❌ Cancel", callback_data: `rm:${index + 1}:n` },
+        ]],
+      }
+    );
     return;
   }
 
   if (message.text === "/clearqueue") {
-    const cleared = await getQueue(env);
-    await saveQueue(env, []);
-    await logEvent(env, "QUEUE_REMOVED", "Queue cleared", { count: cleared.length });
-    await tgSend(env, chatId, "🗑️ Queue cleared completely.");
+    const queue = await getQueue(env);
+    if (queue.length === 0) {
+      await tgSend(env, chatId, "Queue is already empty.");
+      return;
+    }
+    await tgSend(
+      env,
+      chatId,
+      `⚠️ This will permanently remove ${queue.length} queued video(s). This can't be undone. Are you sure?`,
+      {
+        inline_keyboard: [[
+          { text: "🗑️ Yes, clear everything", callback_data: "cq:y" },
+          { text: "❌ Cancel", callback_data: "cq:n" },
+        ]],
+      }
+    );
     return;
   }
 
@@ -1361,6 +1379,54 @@ async function handleCallback(cq, env) {
     }
     const { text, keyboard } = renderLogsPage(env, entries, page, filter);
     await tgEditMessage(env, chatId, cq.message.message_id, text, keyboard.inline_keyboard[0].length ? keyboard : undefined);
+    return;
+  }
+
+  if (cq.data.startsWith("rm:")) {
+    const [, posStr, action] = cq.data.split(":");
+    const position = parseInt(posStr, 10);
+
+    if (action === "n") {
+      await tgAnswerCallback(env, cq.id, "Cancelled");
+      await tgEditMessage(env, chatId, cq.message.message_id, "Cancelled — nothing removed.");
+      return;
+    }
+
+    const queue = await getQueue(env);
+    const index = position - 1;
+    if (isNaN(index) || index < 0 || index >= queue.length) {
+      await tgAnswerCallback(env, cq.id, "Queue changed");
+      await tgEditMessage(env, chatId, cq.message.message_id, "⚠️ The queue changed since this was asked — please check /queue and try again.");
+      return;
+    }
+
+    const [removed] = queue.splice(index, 1);
+    repackQueue(env, queue);
+    await saveQueue(env, queue);
+    if (removed.videoKey) await env.STATE.delete(removed.videoKey);
+    await logEvent(env, "QUEUE_REMOVED", "Video removed from queue", { vid: removed.vid, title: removed.title });
+
+    await tgAnswerCallback(env, cq.id, "Removed");
+    await tgEditMessage(env, chatId, cq.message.message_id, `🗑️ Removed "${escapeHtml(removed.title)}" from the queue. ${queue.length} left.`);
+    return;
+  }
+
+  if (cq.data === "cq:y" || cq.data === "cq:n") {
+    if (cq.data === "cq:n") {
+      await tgAnswerCallback(env, cq.id, "Cancelled");
+      await tgEditMessage(env, chatId, cq.message.message_id, "Cancelled — queue unchanged.");
+      return;
+    }
+
+    const cleared = await getQueue(env);
+    for (const item of cleared) {
+      if (item.videoKey) await env.STATE.delete(item.videoKey);
+    }
+    await saveQueue(env, []);
+    await logEvent(env, "QUEUE_REMOVED", "Queue cleared", { count: cleared.length });
+
+    await tgAnswerCallback(env, cq.id, "Cleared");
+    await tgEditMessage(env, chatId, cq.message.message_id, `🗑️ Queue cleared completely (${cleared.length} video(s) removed).`);
     return;
   }
 
