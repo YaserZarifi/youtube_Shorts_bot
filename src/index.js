@@ -95,6 +95,23 @@ async function saveQueue(env, queue) {
   await env.STATE.put("queue", JSON.stringify(queue));
 }
 
+const EVENT_LOG_CAP = 200;
+
+// Append a lifecycle event to the rolling `eventLog` array in KV (same
+// capped-array pattern as `postedVideos`). Fire-and-forget: any failure in
+// here is swallowed with console.error so logging can never throw or interrupt
+// the bot operation it's recording. `meta` is optional small extra context.
+async function logEvent(env, type, message, meta) {
+  try {
+    const raw = await env.STATE.get("eventLog");
+    const log = raw ? JSON.parse(raw) : [];
+    log.unshift({ type, message, meta: meta || undefined, timestamp: Date.now() });
+    await env.STATE.put("eventLog", JSON.stringify(log.slice(0, EVENT_LOG_CAP)));
+  } catch (err) {
+    console.error("logEvent failed:", type, err.message);
+  }
+}
+
 function dateKey(ms, timeZone) {
   return new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
 }
@@ -241,6 +258,10 @@ async function fetchWithRetry(url, retries = 2) {
 // bytes are downloaded from Telegram at upload time, never stored in KV.
 async function beginIntake(env, chatId, { fileId, fileUniqueId, caption, fileSize }) {
   const cleaned = cleanCaption(caption || "");
+  await logEvent(env, "VIDEO_RECEIVED", "Video received", {
+    caption: cleaned ? cleaned.slice(0, 80) : undefined,
+    chatId,
+  });
   if (cleaned) {
     await env.STATE.put(
       `pending:${chatId}`,
@@ -295,6 +316,7 @@ async function fetchVideoBytes(env, item) {
   if (item.videoKey) {
     const bytes = await env.STATE.get(item.videoKey, "arrayBuffer");
     if (!bytes) throw new Error(`legacy videoKey ${item.videoKey} not found in KV`);
+    await logEvent(env, "SCHEMA_FALLBACK_USED", "Legacy videoKey fallback used", { title: item.title });
     return bytes;
   }
   throw new Error("queue item has neither fileId nor videoKey");
@@ -325,6 +347,97 @@ function renderQueuePage(env, queue, page, pausedNote) {
   if (safePage < totalPages) row.push({ text: "Next ▶️", callback_data: `qp:${safePage + 1}` });
 
   const text = `${pausedNote}📋 ${queue.length} video(s) queued (page ${safePage}/${totalPages}):\n\n${list}\n\nTo remove one, send: /remove (position number)\nTo clear everything: /clearqueue`;
+  return { text, keyboard: { inline_keyboard: [row] } };
+}
+
+// Log lines are single short lines, so more fit per page than /queue items
+// while staying well under Telegram's 4096-char message limit.
+const LOGS_PAGE_SIZE = 15;
+
+async function getEventLog(env) {
+  const raw = await env.STATE.get("eventLog");
+  return raw ? JSON.parse(raw) : [];
+}
+
+// Icon per event type — granular within three severity buckets so /logs reads
+// at a glance: success (🎬/🤖/📝/✅/⏫/▶️), warning (⚠️/🗑️/⏸️/♻️), error (❌/🚫).
+const EVENT_ICONS = {
+  VIDEO_RECEIVED: "🎬",
+  AI_STARTED: "🤖",
+  DRAFT_CREATED: "📝",
+  QUEUE_ADDED: "✅",
+  UPLOAD_STARTED: "⏫",
+  UPLOAD_SUCCESS: "✅",
+  QUEUE_RESUMED: "▶️",
+  VIDEO_REJECTED: "⚠️",
+  QUEUE_REMOVED: "🗑️",
+  QUEUE_PAUSED: "⏸️",
+  SCHEMA_FALLBACK_USED: "♻️",
+  AI_FAILED: "❌",
+  UPLOAD_FAILED: "❌",
+  QUOTA_EXCEEDED: "🚫",
+};
+
+// Severity bucket per type. Drives the /logs errors triage filter (warning+error).
+const EVENT_SEVERITY = {
+  VIDEO_RECEIVED: "success",
+  AI_STARTED: "success",
+  DRAFT_CREATED: "success",
+  QUEUE_ADDED: "success",
+  UPLOAD_STARTED: "success",
+  UPLOAD_SUCCESS: "success",
+  QUEUE_RESUMED: "success",
+  VIDEO_REJECTED: "warning",
+  QUEUE_REMOVED: "warning",
+  QUEUE_PAUSED: "warning",
+  SCHEMA_FALLBACK_USED: "warning",
+  AI_FAILED: "error",
+  UPLOAD_FAILED: "error",
+  QUOTA_EXCEEDED: "error",
+};
+
+const isErrorishEvent = (ev) => EVENT_SEVERITY[ev.type] === "warning" || EVENT_SEVERITY[ev.type] === "error";
+
+// Turn an event's small meta into a short trailing detail, HTML-escaped since
+// the message is sent with HTML parse mode. Titles/captions are clipped.
+function eventDetail(ev) {
+  const m = ev.meta || {};
+  const clip = (s) => (String(s).length > 40 ? String(s).slice(0, 37) + "..." : String(s));
+  if (m.title) return ` — "${escapeHtml(clip(m.title))}"` + (m.error ? ` (${escapeHtml(m.error)})` : "");
+  if (m.error) return ` (${escapeHtml(m.error)})`;
+  if (m.reason) return ` — ${escapeHtml(m.reason)}`;
+  if (m.caption) return ` — "${escapeHtml(clip(m.caption))}"`;
+  if (typeof m.count === "number") return ` — ${m.count} item(s)`;
+  if (m.via) return ` (${escapeHtml(m.via)})`;
+  return "";
+}
+
+// Render one page of /logs, mirroring renderQueuePage exactly (same pagination
+// math, same button shape). `filter` is "errors" or "all"; the errors filter is
+// carried across pages via an ":e" segment on the lp: callback so paging stays
+// within the filtered view.
+function renderLogsPage(env, entries, page, filter) {
+  const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+  const totalPages = Math.max(1, Math.ceil(entries.length / LOGS_PAGE_SIZE));
+  const safePage = Math.min(Math.max(1, page), totalPages);
+  const start = (safePage - 1) * LOGS_PAGE_SIZE;
+  const filterSeg = filter === "errors" ? ":e" : "";
+  const list = entries
+    .slice(start, start + LOGS_PAGE_SIZE)
+    .map((ev) => {
+      const icon = EVENT_ICONS[ev.type] || "•";
+      return `${escapeHtml(formatReadable(ev.timestamp, timeZone))} ${icon} ${escapeHtml(ev.message)}${eventDetail(ev)}`;
+    })
+    .join("\n");
+
+  const row = [];
+  if (safePage > 1) row.push({ text: "◀️ Prev", callback_data: `lp:${safePage - 1}${filterSeg}` });
+  if (safePage < totalPages) row.push({ text: "Next ▶️", callback_data: `lp:${safePage + 1}${filterSeg}` });
+
+  const header = filter === "errors"
+    ? `🧾 ${entries.length} warning/error event(s) (page ${safePage}/${totalPages}):`
+    : `🧾 ${entries.length} event(s) logged (page ${safePage}/${totalPages}):`;
+  const text = `${header}\n\n${list}`;
   return { text, keyboard: { inline_keyboard: [row] } };
 }
 
@@ -392,6 +505,7 @@ async function processQueueTick(env) {
     const hoursSinceLastUpload = lastUploadAt ? (Date.now() - lastUploadAt) / (1000 * 60 * 60) : 0;
     if (lastUploadAt && hoursSinceLastUpload >= 24) {
       await env.STATE.delete("queuePaused");
+      await logEvent(env, "QUEUE_RESUMED", "Queue auto-resumed after 24h", { via: "automatic" });
       const notifyId = (env.MY_TELEGRAM_USER_ID || "").split(",")[0].trim();
       if (notifyId) {
         await tgSend(env, notifyId, `▶️ Queue auto-resumed — it's been 24h since your last upload, so quota should have reset. I'll try the next video on the next hourly check.`);
@@ -454,6 +568,7 @@ async function processQueueTick(env) {
   }
 
   try {
+    await logEvent(env, "UPLOAD_STARTED", "Upload started", { title: item.title });
     const videoId = await uploadShort(env, videoBytes, {
       title: item.title,
       description: item.description,
@@ -474,12 +589,15 @@ async function processQueueTick(env) {
     posted.unshift({ id: videoId, title: item.title, uploadedAt: Date.now() });
     await env.STATE.put("postedVideos", JSON.stringify(posted.slice(0, 200)));
 
+    await logEvent(env, "UPLOAD_SUCCESS", "Video uploaded to queue", { title: item.title, videoId });
     await tgSend(env, item.chatId, `✅ Queued video is live: https://youtu.be/${videoId}\n📋 ${queue.length} left in queue.`);
   } catch (err) {
     console.error("Queued upload failed:", err.message);
 
     if (isQuotaError(err.message)) {
       await env.STATE.put("queuePaused", "YouTube daily quota exceeded");
+      await logEvent(env, "QUOTA_EXCEEDED", "YouTube daily quota exceeded", { title: item.title });
+      await logEvent(env, "QUEUE_PAUSED", "Queue paused", { reason: "YouTube daily quota exceeded" });
       await tgSend(
         env,
         item.chatId,
@@ -489,6 +607,7 @@ async function processQueueTick(env) {
     }
 
     item.failCount = (item.failCount || 0) + 1;
+    await logEvent(env, "UPLOAD_FAILED", "Upload failed", { title: item.title, error: err.message });
     if (item.failCount >= 2) {
       // Drop its slot and re-queue as an auto item so it gets the latest slot,
       // freeing the front for videos behind it instead of blocking them.
@@ -530,6 +649,9 @@ async function handleMessage(message, env) {
     const queue = await getQueue(env);
 
     if (media.file_size && media.file_size > MAX_BYTES) {
+      await logEvent(env, "VIDEO_REJECTED", "Video rejected", {
+        reason: `over 20MB limit (${(media.file_size / 1024 / 1024).toFixed(1)}MB)`,
+      });
       await tgSend(
         env,
         chatId,
@@ -597,6 +719,7 @@ Just send a video (under 20MB). I'll ask what it's about, generate a Persian tit
 
 <b>History:</b>
 /posted — see the last 10 videos actually posted to YouTube, with live view counts
+/logs — see recent bot activity (received, AI, uploads, pauses…). /logs errors shows only warnings & errors. Paginate with /logs 2 or the buttons.
 
 <b>How scheduling works:</b>
 Videos auto-post at most ${helpSchedule.uploadsPerDay} per day, each locked to a fixed time slot (shown in /queue) that never drifts. If you /postnow or /remove a video, the ones behind it move UP to fill the freed slots — nobody's time slides later. Use /setschedule to pin a video to your own time. There's no queue limit — the queue stores lightweight Telegram pointers, so videos can wait as long as needed.
@@ -610,6 +733,7 @@ This bot only responds to your authorized Telegram accounts.
 
     await tgSetCommands(env, [
       { command: "queue", description: "See all queued videos and schedule" },
+      { command: "logs", description: "See recent activity (/logs errors to filter)" },
       { command: "status", description: "Check bot health, capacity, and limits" },
       { command: "preview", description: "See full metadata for a queued video" },
       { command: "posted", description: "See the last 10 posted videos" },
@@ -640,6 +764,24 @@ This bot only responds to your authorized Telegram accounts.
     const pageArg = parseInt(parts[1], 10);
     const page = isNaN(pageArg) || pageArg < 1 ? 1 : pageArg;
     const { text, keyboard } = renderQueuePage(env, queue, page, pausedNote);
+    await tgSend(env, chatId, text, keyboard.inline_keyboard[0].length ? keyboard : undefined);
+    return;
+  }
+
+  if (message.text?.startsWith("/logs")) {
+    const parts = message.text.trim().split(/\s+/);
+    const filter = parts[1] === "errors" ? "errors" : "all";
+    // Page arg is parts[2] for "/logs errors 2", else parts[1] for "/logs 2".
+    const pageArg = parseInt(filter === "errors" ? parts[2] : parts[1], 10);
+    const page = isNaN(pageArg) || pageArg < 1 ? 1 : pageArg;
+
+    const all = await getEventLog(env);
+    const entries = filter === "errors" ? all.filter(isErrorishEvent) : all;
+    if (entries.length === 0) {
+      await tgSend(env, chatId, filter === "errors" ? "🧾 No warnings or errors logged yet." : "🧾 No events logged yet.");
+      return;
+    }
+    const { text, keyboard } = renderLogsPage(env, entries, page, filter);
     await tgSend(env, chatId, text, keyboard.inline_keyboard[0].length ? keyboard : undefined);
     return;
   }
@@ -741,6 +883,7 @@ This bot only responds to your authorized Telegram accounts.
     }
 
     try {
+      await logEvent(env, "UPLOAD_STARTED", "Upload started", { title: item.title });
       const videoId = await uploadShort(env, videoBytes, {
         title: item.title,
         description: item.description,
@@ -765,9 +908,17 @@ This bot only responds to your authorized Telegram accounts.
       posted.unshift({ id: videoId, title: item.title, uploadedAt: Date.now() });
       await env.STATE.put("postedVideos", JSON.stringify(posted.slice(0, 200)));
 
+      await logEvent(env, "UPLOAD_SUCCESS", "Video posted via /postnow", { title: item.title, videoId });
       await tgSend(env, chatId, `✅ Live now: https://youtu.be/${videoId}\n📋 ${queue.length} left in queue.`);
     } catch (err) {
       console.error("Manual /postnow upload failed:", err.message);
+      // Behavior unchanged: /postnow never auto-pauses. Just record the right
+      // event type — quota errors get QUOTA_EXCEEDED, everything else FAILED.
+      if (isQuotaError(err.message)) {
+        await logEvent(env, "QUOTA_EXCEEDED", "YouTube daily quota exceeded", { title: item.title });
+      } else {
+        await logEvent(env, "UPLOAD_FAILED", "Upload failed via /postnow", { title: item.title, error: err.message });
+      }
       await tgSend(env, chatId, `❌ Upload failed: ${err.message}\nIt's still in the queue — nothing was removed.`);
     }
     return;
@@ -786,19 +937,23 @@ This bot only responds to your authorized Telegram accounts.
     const [removed] = queue.splice(index, 1);
     repackQueue(env, queue);
     await saveQueue(env, queue);
+    await logEvent(env, "QUEUE_REMOVED", "Video removed from queue", { title: removed.title });
 
     await tgSend(env, chatId, `🗑️ Removed "${escapeHtml(removed.title)}" from the queue. ${queue.length} left.`);
     return;
   }
 
   if (message.text === "/clearqueue") {
+    const cleared = await getQueue(env);
     await saveQueue(env, []);
+    await logEvent(env, "QUEUE_REMOVED", "Queue cleared", { count: cleared.length });
     await tgSend(env, chatId, "🗑️ Queue cleared completely.");
     return;
   }
 
   if (message.text === "/resumequeue") {
     await env.STATE.delete("queuePaused");
+    await logEvent(env, "QUEUE_RESUMED", "Queue resumed", { via: "manual" });
     await tgSend(env, chatId, "▶️ Queue resumed. It'll try uploading again on the next hourly check.");
     return;
   }
@@ -1008,9 +1163,17 @@ Do you want AI to generate Title + Description + Hashtags?`,
 
 const cleanedInput = cleanCaption(message.text);
 
-const meta = await generateMetadata(env, cleanedInput);
+await logEvent(env, "AI_STARTED", "AI metadata generation started");
+let meta;
+try {
+  meta = await generateMetadata(env, cleanedInput);
+} catch (err) {
+  await logEvent(env, "AI_FAILED", "AI metadata generation failed", { error: err.message });
+  throw err;
+}
 
     await env.STATE.put(`draft:${chatId}`, JSON.stringify({ ...meta, originalText: cleanedInput, fileId: pending.fileId, fileUniqueId: pending.fileUniqueId, fileSize: pending.fileSize || 0 }));
+    await logEvent(env, "DRAFT_CREATED", "Draft created", { title: meta.title });
     await env.STATE.put(`pending:${chatId}`, JSON.stringify({ step: "awaiting_confirmation" }));
 
     const hashtags = meta.hashtags.map((h) => `#${h.replace(/^#/, "")}`).join(" ");
@@ -1044,6 +1207,23 @@ async function handleCallback(cq, env) {
       return;
     }
     const { text, keyboard } = renderQueuePage(env, queue, page, pausedNote);
+    await tgEditMessage(env, chatId, cq.message.message_id, text, keyboard.inline_keyboard[0].length ? keyboard : undefined);
+    return;
+  }
+
+  if (cq.data.startsWith("lp:")) {
+    // Format: "lp:PAGE" (all) or "lp:PAGE:e" (errors filter carried across pages).
+    const segs = cq.data.split(":");
+    const page = parseInt(segs[1], 10) || 1;
+    const filter = segs[2] === "e" ? "errors" : "all";
+    await tgAnswerCallback(env, cq.id, "");
+    const all = await getEventLog(env);
+    const entries = filter === "errors" ? all.filter(isErrorishEvent) : all;
+    if (entries.length === 0) {
+      await tgEditMessage(env, chatId, cq.message.message_id, filter === "errors" ? "🧾 No warnings or errors logged yet." : "🧾 No events logged yet.");
+      return;
+    }
+    const { text, keyboard } = renderLogsPage(env, entries, page, filter);
     await tgEditMessage(env, chatId, cq.message.message_id, text, keyboard.inline_keyboard[0].length ? keyboard : undefined);
     return;
   }
@@ -1183,7 +1363,13 @@ if (cq.data === "generate_ai" || cq.data === "use_raw_title") {
   let meta;
 
   if (cq.data === "generate_ai") {
-    meta = await generateMetadata(env, pending.originalText);
+    await logEvent(env, "AI_STARTED", "AI metadata generation started");
+    try {
+      meta = await generateMetadata(env, pending.originalText);
+    } catch (err) {
+      await logEvent(env, "AI_FAILED", "AI metadata generation failed", { error: err.message });
+      throw err;
+    }
   } else {
     meta = {
       title: pending.originalText.slice(0, 100),
@@ -1202,6 +1388,7 @@ if (cq.data === "generate_ai" || cq.data === "use_raw_title") {
       fileSize: pending.fileSize || 0,
     })
   );
+  await logEvent(env, "DRAFT_CREATED", "Draft created", { title: meta.title });
 
   await env.STATE.put(
     `pending:${chatId}`,
@@ -1276,6 +1463,7 @@ if (cq.data === "accept" || cq.data === "generate_ai") {
   queue.push(newItem);
   repackQueue(env, queue);
   await saveQueue(env, queue);
+  await logEvent(env, "QUEUE_ADDED", "Video added to queue", { title, scheduledAt: newItem.scheduledAt });
 
   const position = queue.findIndex((q) => q.id === queueId) + 1;
   const timeZone = env.DISPLAY_TIMEZONE || "UTC";
