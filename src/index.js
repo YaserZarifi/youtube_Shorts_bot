@@ -108,6 +108,30 @@ function cleanCaption(text = "") {
   return cleaned;
 }
 
+// Summarizes what cleanCaption() is about to strip, so the confirmation
+// message can tell the user *why* their caption looks different, without
+// changing cleanCaption()'s own return contract for its other callers.
+function getCleanupSummary(text = "") {
+  const parts = [];
+  const usernames = (text.match(/@[A-Za-z0-9_]{5,}/g) || []).length;
+  if (usernames) parts.push(`${usernames} username${usernames === 1 ? "" : "s"}`);
+
+  const tgLinkRe = /https?:\/\/(?:t\.me|telegram\.me)\/\S+|(?:t\.me|telegram\.me)\/\S+/gi;
+  const tgLinks = (text.match(tgLinkRe) || []).length;
+  const withoutTgLinks = text.replace(tgLinkRe, "");
+  const otherUrls = (withoutTgLinks.match(/https?:\/\/\S+|www\.\S+/gi) || []).length;
+  const totalLinks = tgLinks + otherUrls;
+  if (totalLinks) parts.push(`${totalLinks} link${totalLinks === 1 ? "" : "s"}`);
+
+  let filteredWords = 0;
+  for (const word of FILTER_WORDS) {
+    filteredWords += text.split(word).length - 1;
+  }
+  if (filteredWords) parts.push(`${filteredWords} filtered word${filteredWords === 1 ? "" : "s"}`);
+
+  return parts.length ? `🧹 Removed: ${parts.join(", ")}` : "";
+}
+
 function isAuthorized(env, userId) {
   const allowed = (env.MY_TELEGRAM_USER_ID || "")
     .split(",")
@@ -312,6 +336,7 @@ async function fetchWithRetry(url, retries = 2) {
 // bytes are downloaded from Telegram at upload time, never stored in KV.
 async function beginIntake(env, chatId, { fileId, fileUniqueId, caption, fileSize }) {
   const cleaned = cleanCaption(caption || "");
+  const cleanupNote = getCleanupSummary(caption || "");
   const vid = await nextVideoId(env);
   await logEvent(env, "VIDEO_RECEIVED", "Video received", {
     vid,
@@ -333,13 +358,14 @@ async function beginIntake(env, chatId, { fileId, fileUniqueId, caption, fileSiz
     await tgSend(
       env,
       chatId,
-      `📝 I found this caption:\n\n<b>${escapeHtml(cleaned)}</b>\n\nUse this as the video title?\n\nYou can edit it before continuing.`,
+      `📝 I found this caption:\n\n<b>${escapeHtml(cleaned)}</b>\n\n${cleanupNote ? escapeHtml(cleanupNote) + "\n\n" : ""}Use this as the video title?\n\nYou can edit it before continuing.`,
       {
         inline_keyboard: [
           [
             { text: "✅ Use this title", callback_data: "use_caption_title" },
             { text: "✏️ Edit title", callback_data: "edit_caption_title" },
           ],
+          [{ text: "🚫 Cancel", callback_data: "cancel" }],
         ],
       }
     );
@@ -354,7 +380,7 @@ async function beginIntake(env, chatId, { fileId, fileUniqueId, caption, fileSiz
         fileSize: fileSize || 0,
       })
     );
-    await tgSend(env, chatId, "🎬 Got the video ✅\n\nPlease send me the video title/caption.");
+    await tgSend(env, chatId, "🎬 Got the video ✅\n\nPlease send me the video title/caption (or /cancel to abort).");
   }
 }
 
@@ -792,12 +818,21 @@ async function regenerateAndSendPreview(env, chatId, draft, newGuidance) {
     ? [...(draft.extraGuidance || []), newGuidance]
     : (draft.extraGuidance || []);
 
+  // Progress placeholder: edited in place once the AI call resolves, so the
+  // user sees "Generating..." replaced by the real result instead of a
+  // silent gap while env.AI.run() executes.
+  const progress = await tgSend(env, chatId, "🤖 Generating title, description and hashtags...");
+  const progressMsgId = progress?.result?.message_id;
+
   await logEvent(env, "AI_STARTED", "AI metadata generation started", { vid: draft.vid, guidanceCount: extraGuidance.length });
   let meta;
   try {
     meta = await generateMetadata(env, draft.originalText, extraGuidance);
   } catch (err) {
     await logEvent(env, "AI_FAILED", "AI metadata generation failed", { vid: draft.vid, error: err.message });
+    if (progressMsgId) {
+      await tgEditMessage(env, chatId, progressMsgId, "❌ AI generation failed. Please try again or use your original text.");
+    }
     throw err;
   }
 
@@ -816,16 +851,24 @@ async function regenerateAndSendPreview(env, chatId, draft, newGuidance) {
   const guidanceNote = extraGuidance.length ? `\n\n<i>Applied ${extraGuidance.length} regeneration instruction${extraGuidance.length === 1 ? "" : "s"}.</i>` : "";
   const preview = `${warningsBanner}<b>Title:</b> ${escapeHtml(meta.title)}\n\n<b>Description:</b>\n${escapeHtml(meta.description)}\n\n<b>Hashtags:</b> ${escapeHtml(hashtags)}${guidanceNote}`;
 
-  await tgSend(env, chatId, preview, {
+  const previewKeyboard = {
     inline_keyboard: [
       [
         { text: "✅ Accept AI version", callback_data: "accept" },
         { text: "📝 Use my text as title only", callback_data: "original" },
       ],
       [{ text: "🔄 Regenerate", callback_data: "regenerate" }],
+      [{ text: "🚫 Cancel", callback_data: "cancel" }],
     ],
-  });
+  };
+
+  if (progressMsgId) {
+    await tgEditMessage(env, chatId, progressMsgId, preview, previewKeyboard);
+  } else {
+    await tgSend(env, chatId, preview, previewKeyboard);
+  }
 }
+
 
 async function handleMessage(message, env) {
   const chatId = message.chat.id;
@@ -833,6 +876,13 @@ async function handleMessage(message, env) {
 
   if (!isAuthorized(env, userId)) {
     await tgSend(env, chatId, "This bot is private.");
+    return;
+  }
+
+  if (message.text === "/cancel") {
+    await env.STATE.delete(`pending:${chatId}`);
+    await env.STATE.delete(`draft:${chatId}`);
+    await tgSend(env, chatId, "🚫 Cancelled. Send a new video whenever you're ready.");
     return;
   }
 
@@ -1361,6 +1411,7 @@ This bot only responds to your authorized Telegram accounts.
                 callback_data: "use_raw_title",
               },
             ],
+            [{ text: "🚫 Cancel", callback_data: "cancel" }],
           ],
         }
       );
@@ -1406,6 +1457,8 @@ Do you want AI to generate Title + Description + Hashtags?`,
                     text: "❌ No, use my title",
                     callback_data: "use_raw_title"
                 }
+            ], [
+                { text: "🚫 Cancel", callback_data: "cancel" }
             ]]
         }
     );
@@ -1443,6 +1496,14 @@ async function handleCallback(cq, env) {
   const chatId = cq.message.chat.id;
   const userId = cq.from.id.toString();
   if (!isAuthorized(env, userId)) return;
+
+  if (cq.data === "cancel") {
+    await env.STATE.delete(`pending:${chatId}`);
+    await env.STATE.delete(`draft:${chatId}`);
+    await tgAnswerCallback(env, cq.id, "Cancelled");
+    await tgEditMessage(env, chatId, cq.message.message_id, "🚫 Cancelled. Send a new video whenever you're ready.");
+    return;
+  }
 
   if (cq.data.startsWith("qp:")) {
     const page = parseInt(cq.data.split(":")[1], 10) || 1;
@@ -1591,7 +1652,7 @@ async function handleCallback(cq, env) {
       env,
       chatId,
       "🔄 Want to give any guidance for the regeneration (tone, focus, what to avoid, etc.)? Type it below, or tap Skip to just regenerate.",
-      { inline_keyboard: [[{ text: "⏭️ Skip", callback_data: "regenerate_skip" }]] }
+      { inline_keyboard: [[{ text: "⏭️ Skip", callback_data: "regenerate_skip" }], [{ text: "🚫 Cancel", callback_data: "cancel" }]] }
     );
     return;
   }
@@ -1650,6 +1711,7 @@ async function handleCallback(cq, env) {
             callback_data: "use_raw_title",
           },
         ],
+        [{ text: "🚫 Cancel", callback_data: "cancel" }],
       ],
     }
   );
@@ -1676,7 +1738,7 @@ await env.STATE.put(
     })
 );
 
-  await tgSend(env, chatId, "✏️ Send the new title:", {
+  await tgSend(env, chatId, "✏️ Send the new title (or /cancel to abort):", {
     force_reply: true,
   });
 
