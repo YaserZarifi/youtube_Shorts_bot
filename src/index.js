@@ -818,6 +818,7 @@ Just send a video (under 20MB). I'll ask what it's about, generate a Persian tit
 <b>History:</b>
 /posted — see the last 10 videos actually posted to YouTube, with live view counts
 /logs — see recent bot activity (received, AI, uploads, pauses…). /logs errors shows only warnings & errors. Paginate with /logs 2 or the buttons.
+/history (id) — full timeline for one video by its ID (e.g. /history VID-20260809-0001, or just /history 0001). No ID shows a list of recent videos.
 
 <b>How scheduling works:</b>
 Videos auto-post at most ${helpSchedule.uploadsPerDay} per day, each locked to a fixed time slot (shown in /queue) that never drifts. If you /postnow or /remove a video, the ones behind it move UP to fill the freed slots — nobody's time slides later. Use /setschedule to pin a video to your own time. There's no queue limit — the queue stores lightweight Telegram pointers, so videos can wait as long as needed.
@@ -832,6 +833,7 @@ This bot only responds to your authorized Telegram accounts.
     await tgSetCommands(env, [
       { command: "queue", description: "See all queued videos and schedule" },
       { command: "logs", description: "See recent activity (/logs errors to filter)" },
+      { command: "history", description: "Full timeline for one video by ID" },
       { command: "status", description: "Check bot health, capacity, and limits" },
       { command: "preview", description: "See full metadata for a queued video" },
       { command: "posted", description: "See the last 10 posted videos" },
