@@ -22,11 +22,13 @@ export async function tgSend(env, chatId, text, replyMarkup) {
   return data;
 }
 
-export async function tgEditMessage(env, chatId, messageId, text) {
+export async function tgEditMessage(env, chatId, messageId, text, replyMarkup) {
+  const body = { chat_id: chatId, message_id: messageId, text, parse_mode: "HTML" };
+  if (replyMarkup) body.reply_markup = replyMarkup;
   await fetch(`${TG_API(env.TELEGRAM_BOT_TOKEN)}/editMessageText`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, parse_mode: "HTML" }),
+    body: JSON.stringify(body),
   });
 }
 
