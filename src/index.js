@@ -746,6 +746,52 @@ async function processQueueTick(env) {
   }
 }
 
+// Re-run AI metadata generation for a draft (new or existing), stacking any
+// newly given guidance on top of whatever guidance was already collected
+// from earlier regenerations, then persist the updated draft and send the
+// refreshed preview with Accept / Use-my-text / Regenerate buttons. Shared
+// by the very first generation, the explicit "generate_ai" choice, and every
+// subsequent /regenerate tap — so there is exactly one preview format.
+async function regenerateAndSendPreview(env, chatId, draft, newGuidance) {
+  const extraGuidance = newGuidance
+    ? [...(draft.extraGuidance || []), newGuidance]
+    : (draft.extraGuidance || []);
+
+  await logEvent(env, "AI_STARTED", "AI metadata generation started", { vid: draft.vid, guidanceCount: extraGuidance.length });
+  let meta;
+  try {
+    meta = await generateMetadata(env, draft.originalText, extraGuidance);
+  } catch (err) {
+    await logEvent(env, "AI_FAILED", "AI metadata generation failed", { vid: draft.vid, error: err.message });
+    throw err;
+  }
+
+  const aiWarnings = validateAIMetadata(meta);
+  if (aiWarnings.length) {
+    await logEvent(env, "AI_VALIDATION_WARNING", "AI output flagged for review", { vid: draft.vid, title: meta.title, warnings: aiWarnings });
+  }
+
+  const updatedDraft = { ...draft, ...meta, extraGuidance };
+  await env.STATE.put(`draft:${chatId}`, JSON.stringify(updatedDraft));
+  await logEvent(env, "DRAFT_CREATED", "Draft created", { vid: draft.vid, title: meta.title, guidanceCount: extraGuidance.length });
+  await env.STATE.put(`pending:${chatId}`, JSON.stringify({ step: "awaiting_confirmation" }));
+
+  const hashtags = meta.hashtags.map((h) => `#${h.replace(/^#/, "")}`).join(" ");
+  const warningsBanner = aiWarnings.length ? `⚠️ <b>Review before accepting:</b>\n${aiWarnings.map((w) => `• ${escapeHtml(w)}`).join("\n")}\n\n` : "";
+  const guidanceNote = extraGuidance.length ? `\n\n<i>Applied ${extraGuidance.length} regeneration instruction${extraGuidance.length === 1 ? "" : "s"}.</i>` : "";
+  const preview = `${warningsBanner}<b>Title:</b> ${escapeHtml(meta.title)}\n\n<b>Description:</b>\n${escapeHtml(meta.description)}\n\n<b>Hashtags:</b> ${escapeHtml(hashtags)}${guidanceNote}`;
+
+  await tgSend(env, chatId, preview, {
+    inline_keyboard: [
+      [
+        { text: "✅ Accept AI version", callback_data: "accept" },
+        { text: "📝 Use my text as title only", callback_data: "original" },
+      ],
+      [{ text: "🔄 Regenerate", callback_data: "regenerate" }],
+    ],
+  });
+}
+
 async function handleMessage(message, env) {
   const chatId = message.chat.id;
   const userId = message.from.id.toString();
@@ -1346,41 +1392,29 @@ Do you want AI to generate Title + Description + Hashtags?`,
     return;
 }
 
+    if (pending.step === "awaiting_regenerate_prompt") {
+      const draftRaw = await env.STATE.get(`draft:${chatId}`);
+      if (!draftRaw) {
+        await tgSend(env, chatId, "⚠️ This request expired, please resend the video.");
+        return;
+      }
+      await regenerateAndSendPreview(env, chatId, JSON.parse(draftRaw), message.text.trim());
+      return;
+    }
+
     if (pending.step !== "awaiting_caption") return;
 
-const cleanedInput = cleanCaption(message.text);
+    const cleanedInput = cleanCaption(message.text);
 
-await logEvent(env, "AI_STARTED", "AI metadata generation started", { vid: pending.vid });
-let meta;
-try {
-  meta = await generateMetadata(env, cleanedInput);
-} catch (err) {
-  await logEvent(env, "AI_FAILED", "AI metadata generation failed", { vid: pending.vid, error: err.message });
-  throw err;
-}
-
-const aiWarnings = validateAIMetadata(meta);
-if (aiWarnings.length) {
-  await logEvent(env, "AI_VALIDATION_WARNING", "AI output flagged for review", { vid: pending.vid, title: meta.title, warnings: aiWarnings });
-}
-
-    await env.STATE.put(`draft:${chatId}`, JSON.stringify({ ...meta, vid: pending.vid, originalText: cleanedInput, fileId: pending.fileId, fileUniqueId: pending.fileUniqueId, fileSize: pending.fileSize || 0 }));
-    await logEvent(env, "DRAFT_CREATED", "Draft created", { vid: pending.vid, title: meta.title });
-    await env.STATE.put(`pending:${chatId}`, JSON.stringify({ step: "awaiting_confirmation" }));
-
-    const hashtags = meta.hashtags.map((h) => `#${h.replace(/^#/, "")}`).join(" ");
-    const warningsBanner = aiWarnings.length ? `⚠️ <b>Review before accepting:</b>\n${aiWarnings.map((w) => `• ${escapeHtml(w)}`).join("\n")}\n\n` : "";
-    const preview = `${warningsBanner}<b>Title:</b> ${escapeHtml(meta.title)}\n\n<b>Description:</b>\n${escapeHtml(meta.description)}\n\n<b>Hashtags:</b> ${escapeHtml(hashtags)}`;
-
-    // --- THE TWO BUTTONS ---
-    await tgSend(env, chatId, preview, {
-      inline_keyboard: [
-        [
-          { text: "✅ Accept AI version", callback_data: "accept" },
-          { text: "📝 Use my text as title only", callback_data: "original" },
-        ],
-      ],
+    await regenerateAndSendPreview(env, chatId, {
+      vid: pending.vid,
+      originalText: cleanedInput,
+      fileId: pending.fileId,
+      fileUniqueId: pending.fileUniqueId,
+      fileSize: pending.fileSize || 0,
+      extraGuidance: [],
     });
+    return;
   }
 }
 
@@ -1523,6 +1557,42 @@ async function handleCallback(cq, env) {
     return;
   }
 
+  if (cq.data === "regenerate") {
+    const draftRaw = await env.STATE.get(`draft:${chatId}`);
+    if (!draftRaw) {
+      await tgAnswerCallback(env, cq.id, "Expired");
+      await tgEditMessage(env, chatId, cq.message.message_id, "⚠️ This request expired, please resend the video.");
+      return;
+    }
+    await env.STATE.put(`pending:${chatId}`, JSON.stringify({ step: "awaiting_regenerate_prompt" }));
+    await tgAnswerCallback(env, cq.id, "");
+    await tgSend(
+      env,
+      chatId,
+      "🔄 Want to give any guidance for the regeneration (tone, focus, what to avoid, etc.)? Type it below, or tap Skip to just regenerate.",
+      { inline_keyboard: [[{ text: "⏭️ Skip", callback_data: "regenerate_skip" }]] }
+    );
+    return;
+  }
+
+  if (cq.data === "regenerate_skip") {
+    const pendingRaw = await env.STATE.get(`pending:${chatId}`);
+    const pending = pendingRaw ? JSON.parse(pendingRaw) : null;
+    if (!pending || pending.step !== "awaiting_regenerate_prompt") {
+      await tgAnswerCallback(env, cq.id, "Expired");
+      return;
+    }
+    const draftRaw = await env.STATE.get(`draft:${chatId}`);
+    if (!draftRaw) {
+      await tgAnswerCallback(env, cq.id, "Expired");
+      await tgEditMessage(env, chatId, cq.message.message_id, "⚠️ This request expired, please resend the video.");
+      return;
+    }
+    await tgAnswerCallback(env, cq.id, "Regenerating...");
+    await regenerateAndSendPreview(env, chatId, JSON.parse(draftRaw));
+    return;
+  }
+
   if (cq.data === "use_caption_title") {
   const pendingRaw = await env.STATE.get(`pending:${chatId}`);
   if (!pendingRaw) return;
@@ -1603,28 +1673,24 @@ if (cq.data === "generate_ai" || cq.data === "use_raw_title") {
 
   const pending = JSON.parse(pendingRaw);
 
-  let meta;
-  let aiWarnings = [];
-
   if (cq.data === "generate_ai") {
-    await logEvent(env, "AI_STARTED", "AI metadata generation started", { vid: pending.vid });
-    try {
-      meta = await generateMetadata(env, pending.originalText);
-    } catch (err) {
-      await logEvent(env, "AI_FAILED", "AI metadata generation failed", { vid: pending.vid, error: err.message });
-      throw err;
-    }
-    aiWarnings = validateAIMetadata(meta);
-    if (aiWarnings.length) {
-      await logEvent(env, "AI_VALIDATION_WARNING", "AI output flagged for review", { vid: pending.vid, title: meta.title, warnings: aiWarnings });
-    }
-  } else {
-    meta = {
-      title: pending.originalText.slice(0, 100),
-      description: "",
-      hashtags: [],
-    };
+    await tgAnswerCallback(env, cq.id, "Generating...");
+    await regenerateAndSendPreview(env, chatId, {
+      vid: pending.vid,
+      originalText: pending.originalText,
+      fileId: pending.fileId,
+      fileUniqueId: pending.fileUniqueId,
+      fileSize: pending.fileSize || 0,
+      extraGuidance: [],
+    });
+    return;
   }
+
+  const meta = {
+    title: pending.originalText.slice(0, 100),
+    description: "",
+    hashtags: [],
+  };
 
   await env.STATE.put(
     `draft:${chatId}`,
@@ -1650,17 +1716,12 @@ if (cq.data === "generate_ai" || cq.data === "use_raw_title") {
     .map((h) => `#${h.replace(/^#/, "")}`)
     .join(" ");
 
-  const warningsBanner = aiWarnings.length ? `⚠️ <b>Review before accepting:</b>\n${aiWarnings.map((w) => `• ${escapeHtml(w)}`).join("\n")}\n\n` : "";
-
   const preview =
-    warningsBanner +
     `<b>Title:</b> ${escapeHtml(meta.title)}\n\n` +
     `<b>Description:</b>\n${escapeHtml(meta.description || "(none)")}\n\n` +
     `<b>Hashtags:</b> ${escapeHtml(hashtags || "(none)")}`;
 
-
   await tgAnswerCallback(env, cq.id, "Ready");
-
 
   await tgSend(env, chatId, preview, {
     inline_keyboard: [

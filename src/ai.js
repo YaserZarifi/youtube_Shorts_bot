@@ -1,4 +1,8 @@
-export async function generateMetadata(env, userText) {
+export async function generateMetadata(env, userText, extraGuidance = []) {
+  const guidanceList = Array.isArray(extraGuidance) ? extraGuidance : [extraGuidance].filter(Boolean);
+  const guidanceBlock = guidanceList.length
+    ? `\n\nAdditional instructions from the creator for this regeneration (apply ALL of these, most recent last):\n${guidanceList.map((g, i) => `${i + 1}. ${g}`).join("\n")}\n`
+    : "";
 //   const prompt = `You are helping write a YouTube Shorts upload.
 // The creator gave this short note about the video: "${userText}"
 
@@ -121,7 +125,7 @@ Rules:
   viral, fyp, foryou, explore, trending, xyzbca
 - Do not generate duplicate hashtags.
 - Return hashtags WITHOUT the # symbol.
-
+${guidanceBlock}
 Return ONLY valid JSON.
 Do not include markdown, explanations, or extra text.
 
