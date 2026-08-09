@@ -279,13 +279,25 @@ async function beginIntake(env, chatId, { fileId, fileUniqueId, caption, fileSiz
   }
 }
 
-// Download a queued video's bytes fresh from Telegram right before upload.
-// file_ids can expire, so resolve a current download URL and fetch at post
-// time instead of persisting bytes in KV. Throws on failure.
-async function fetchVideoBytes(env, fileId) {
-  const fileUrl = await tgGetFileUrl(env, fileId);
-  const fileRes = await fetchWithRetry(fileUrl, 2);
-  return fileRes.arrayBuffer();
+// Get a queued video's bytes right before upload. New-format items carry a
+// Telegram file pointer (item.fileId): file_ids can expire, so resolve a current
+// download URL and fetch fresh at post time instead of persisting bytes in KV.
+// Legacy items (queued before the pointer refactor) instead carry item.videoKey,
+// with their bytes still sitting in KV under that key — read those directly.
+// Throws on failure (missing pointer, expired file, or a videoKey blob that's
+// gone) so callers route it into their fetch-failure handling.
+async function fetchVideoBytes(env, item) {
+  if (item.fileId) {
+    const fileUrl = await tgGetFileUrl(env, item.fileId);
+    const fileRes = await fetchWithRetry(fileUrl, 2);
+    return fileRes.arrayBuffer();
+  }
+  if (item.videoKey) {
+    const bytes = await env.STATE.get(item.videoKey, "arrayBuffer");
+    if (!bytes) throw new Error(`legacy videoKey ${item.videoKey} not found in KV`);
+    return bytes;
+  }
+  throw new Error("queue item has neither fileId nor videoKey");
 }
 
 const QUEUE_PAGE_SIZE = 8;
@@ -417,7 +429,7 @@ async function processQueueTick(env) {
   // distinct, unrecoverable failure — handle it separately from upload errors.
   let videoBytes;
   try {
-    videoBytes = await fetchVideoBytes(env, item.fileId);
+    videoBytes = await fetchVideoBytes(env, item);
   } catch (err) {
     console.error("Telegram fetch failed for queued item:", item.id, err.message);
     item.fetchFailCount = (item.fetchFailCount || 0) + 1;
@@ -451,6 +463,9 @@ async function processQueueTick(env) {
     queue.shift();
     repackQueue(env, queue);
     await saveQueue(env, queue);
+    // Legacy items stored their bytes in KV under videoKey; free that blob now
+    // that it's posted. New-format items never persisted bytes, so skip this.
+    if (item.videoKey) await env.STATE.delete(item.videoKey);
     await env.STATE.put(countKey, (count + 1).toString(), { expirationTtl: 60 * 60 * 26 });
     await env.STATE.put("lastUploadAt", Date.now().toString());
 
@@ -714,7 +729,7 @@ This bot only responds to your authorized Telegram accounts.
 
     let videoBytes;
     try {
-      videoBytes = await fetchVideoBytes(env, item.fileId);
+      videoBytes = await fetchVideoBytes(env, item);
     } catch (err) {
       console.error("Telegram fetch failed for /postnow:", item.id, err.message);
       await tgSend(
@@ -735,6 +750,9 @@ This bot only responds to your authorized Telegram accounts.
       queue.splice(index, 1);
       repackQueue(env, queue);
       await saveQueue(env, queue);
+      // Legacy items stored their bytes in KV under videoKey; free that blob now
+      // that it's posted. New-format items never persisted bytes, so skip this.
+      if (item.videoKey) await env.STATE.delete(item.videoKey);
 
       const today = new Date().toISOString().slice(0, 10);
       const countKey = `ytcount:${today}`;
