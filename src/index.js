@@ -1,5 +1,5 @@
 import { tgSend, tgEditMessage, tgAnswerCallback, tgGetFileUrl, escapeHtml, tgSetCommands } from "./telegram.js";
-import { generateMetadata } from "./ai.js";
+import { generateMetadata, validateAIMetadata } from "./ai.js";
 import { uploadShort, getVideoStats, getAccessToken } from "./youtube.js";
 
 const MAX_BYTES = 20 * 1024 * 1024; // Telegram bot download cap
@@ -12,7 +12,8 @@ const TITLE_SUFFIX = " #shorts #persian #فارسی";
 const MAX_TITLE_LENGTH = 100;
 
 // Derive the posting schedule from wrangler.jsonc vars so editing config actually
-// moves both /status and the scheduler. Slots are evenly spaced: the first at
+// moves both /status and the scheduler. Slots are evenly spaced: the first atimport { generateMetadata, validateAIMetadata } from "./ai.js";
+
 // POSTING_WINDOW_START_HOUR, each MIN_HOURS_BETWEEN_UPLOADS apart, MAX_UPLOADS_PER_DAY
 // of them. Offsets are minutes-from-midnight and may exceed 1440 (past-midnight slots).
 function getSchedule(env) {
@@ -394,6 +395,7 @@ const EVENT_ICONS = {
   QUEUE_REMOVED: "🗑️",
   QUEUE_PAUSED: "⏸️",
   SCHEMA_FALLBACK_USED: "♻️",
+  AI_VALIDATION_WARNING: "🩺",
   AI_FAILED: "❌",
   UPLOAD_FAILED: "❌",
   QUOTA_EXCEEDED: "🚫",
@@ -412,6 +414,7 @@ const EVENT_SEVERITY = {
   QUEUE_REMOVED: "warning",
   QUEUE_PAUSED: "warning",
   SCHEMA_FALLBACK_USED: "warning",
+  AI_VALIDATION_WARNING: "warning",
   AI_FAILED: "error",
   UPLOAD_FAILED: "error",
   QUOTA_EXCEEDED: "error",
@@ -440,6 +443,10 @@ const VID_STATUS = {
 function eventDetail(ev) {
   const m = ev.meta || {};
   const clip = (s) => (String(s).length > 40 ? String(s).slice(0, 37) + "..." : String(s));
+  if (m.warnings && m.warnings.length) {
+    const more = m.warnings.length > 1 ? ` (+${m.warnings.length - 1} more)` : "";
+    return ` — "${escapeHtml(clip(m.title || ""))}": ${escapeHtml(clip(m.warnings[0]))}${more}`;
+  }
   if (m.title) return ` — "${escapeHtml(clip(m.title))}"` + (m.error ? ` (${escapeHtml(m.error)})` : "");
   if (m.error) return ` (${escapeHtml(m.error)})`;
   if (m.reason) return ` — ${escapeHtml(m.reason)}`;
@@ -1295,12 +1302,18 @@ try {
   throw err;
 }
 
+const aiWarnings = validateAIMetadata(meta);
+if (aiWarnings.length) {
+  await logEvent(env, "AI_VALIDATION_WARNING", "AI output flagged for review", { vid: pending.vid, title: meta.title, warnings: aiWarnings });
+}
+
     await env.STATE.put(`draft:${chatId}`, JSON.stringify({ ...meta, vid: pending.vid, originalText: cleanedInput, fileId: pending.fileId, fileUniqueId: pending.fileUniqueId, fileSize: pending.fileSize || 0 }));
     await logEvent(env, "DRAFT_CREATED", "Draft created", { vid: pending.vid, title: meta.title });
     await env.STATE.put(`pending:${chatId}`, JSON.stringify({ step: "awaiting_confirmation" }));
 
     const hashtags = meta.hashtags.map((h) => `#${h.replace(/^#/, "")}`).join(" ");
-    const preview = `<b>Title:</b> ${escapeHtml(meta.title)}\n\n<b>Description:</b>\n${escapeHtml(meta.description)}\n\n<b>Hashtags:</b> ${escapeHtml(hashtags)}`;
+    const warningsBanner = aiWarnings.length ? `⚠️ <b>Review before accepting:</b>\n${aiWarnings.map((w) => `• ${escapeHtml(w)}`).join("\n")}\n\n` : "";
+    const preview = `${warningsBanner}<b>Title:</b> ${escapeHtml(meta.title)}\n\n<b>Description:</b>\n${escapeHtml(meta.description)}\n\n<b>Hashtags:</b> ${escapeHtml(hashtags)}`;
 
     // --- THE TWO BUTTONS ---
     await tgSend(env, chatId, preview, {
@@ -1486,6 +1499,7 @@ if (cq.data === "generate_ai" || cq.data === "use_raw_title") {
   const pending = JSON.parse(pendingRaw);
 
   let meta;
+  let aiWarnings = [];
 
   if (cq.data === "generate_ai") {
     await logEvent(env, "AI_STARTED", "AI metadata generation started", { vid: pending.vid });
@@ -1494,6 +1508,10 @@ if (cq.data === "generate_ai" || cq.data === "use_raw_title") {
     } catch (err) {
       await logEvent(env, "AI_FAILED", "AI metadata generation failed", { vid: pending.vid, error: err.message });
       throw err;
+    }
+    aiWarnings = validateAIMetadata(meta);
+    if (aiWarnings.length) {
+      await logEvent(env, "AI_VALIDATION_WARNING", "AI output flagged for review", { vid: pending.vid, title: meta.title, warnings: aiWarnings });
     }
   } else {
     meta = {
@@ -1527,7 +1545,10 @@ if (cq.data === "generate_ai" || cq.data === "use_raw_title") {
     .map((h) => `#${h.replace(/^#/, "")}`)
     .join(" ");
 
+  const warningsBanner = aiWarnings.length ? `⚠️ <b>Review before accepting:</b>\n${aiWarnings.map((w) => `• ${escapeHtml(w)}`).join("\n")}\n\n` : "";
+
   const preview =
+    warningsBanner +
     `<b>Title:</b> ${escapeHtml(meta.title)}\n\n` +
     `<b>Description:</b>\n${escapeHtml(meta.description || "(none)")}\n\n` +
     `<b>Hashtags:</b> ${escapeHtml(hashtags || "(none)")}`;

@@ -197,5 +197,46 @@ if (finalTitle.length + TITLE_SUFFIX.length <= 100) {
     title: finalTitle,
     description: finalDescription,
     hashtags,
+    aiFailed: !parsed,
   };
+}
+
+// Pure, code-only checks on already-generated metadata — no AI/API calls.
+// generateMetadata() already truncates the title, dedupes hashtags, and
+// falls back to the raw caption on a JSON parse failure, so this only needs
+// to catch what that fallback can't: AI commentary/JSON leaking into the
+// text, and content that isn't actually Persian. Returns warnings only —
+// nothing here blocks a draft from being queued, it just surfaces a heads-up
+// in the preview message before the person taps Accept.
+export function validateAIMetadata(meta) {
+  const warnings = [];
+  const title = meta.title || "";
+  const description = meta.description || "";
+  const combined = `${title} ${description}`;
+
+  if (meta.aiFailed) {
+    warnings.push("AI response couldn't be parsed — using your original caption as the title instead.");
+  }
+
+  if (/[{}[\]]|```/.test(combined)) {
+    warnings.push("Title/description looks like it may contain leftover JSON or code formatting — worth a check.");
+  }
+
+  const commentaryPhrases = ["here is the title", "here's the title", "sure, here", "as an ai", "i cannot", "i can't"];
+  const lower = combined.toLowerCase();
+  if (commentaryPhrases.some((p) => lower.includes(p))) {
+    warnings.push("Title/description may contain leftover AI commentary — worth a check.");
+  }
+
+  const persianChars = (combined.match(/[\u0600-\u06FF]/g) || []).length;
+  const alphaChars = (combined.match(/[A-Za-z\u0600-\u06FF]/g) || []).length;
+  if (alphaChars >= 10 && persianChars / alphaChars < 0.2) {
+    warnings.push("AI responded mostly in English — check before accepting.");
+  }
+
+  if (/\S{40,}/.test(combined)) {
+    warnings.push("Title/description contains an unusually long unbroken word — may be garbled output.");
+  }
+
+  return warnings;
 }
