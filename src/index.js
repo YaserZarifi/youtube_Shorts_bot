@@ -830,6 +830,10 @@ This bot only responds to your authorized Telegram accounts.
     const projectedSlots = generateAutoSlots(env, Date.now(), autoCount + 1, blockedTimes);
     const nextSlot = projectedSlots[projectedSlots.length - 1];
     const lastQueued = queue.length ? queue[queue.length - 1].scheduledAt : null;
+    // Front of the queue = the actual next video to post (queue is stored sorted
+    // by scheduledAt). Distinct from nextSlot, which is where a brand-new video
+    // added right now would land (behind everything already queued).
+    const nextUp = queue.length ? queue[0].scheduledAt : null;
 
     // The "~" times are the earliest end of each window; the real slot jitters later.
     const slotTimes = schedule.windows.map((w) => offsetToClock(w.startOffsetMin)).join(", ");
@@ -841,6 +845,7 @@ This bot only responds to your authorized Telegram accounts.
 📋 Queue: <b>${queue.length}</b> video(s)
 📅 Today's uploads: <b>${count}/${maxPerDay}</b>
 🕒 Last upload: ${lastUploadAt ? formatReadable(lastUploadAt, timeZone) : "never"}
+📤 Next video will post: ${nextUp ? formatReadable(nextUp, timeZone) : "—"}
 🗓️ Queue posts through: ${lastQueued ? formatReadable(lastQueued, timeZone) : "—"}
 ⏭️ Next new video would post: ${formatReadable(nextSlot, timeZone)}
 ⏸️ Paused: ${paused ? `yes (${paused})` : "no"}
