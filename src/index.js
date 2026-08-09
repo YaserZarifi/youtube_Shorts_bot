@@ -112,6 +112,23 @@ async function logEvent(env, type, message, meta) {
   }
 }
 
+// Mint a permanent, human-readable ID for a freshly received video:
+// VID-YYYYMMDD-NNNN, where the date is today in UTC (matching the ytcount:{today}
+// convention) and NNNN is a per-day sequence starting at 0001. The counter lives
+// in a single KV key per day (vidCounter:{YYYYMMDD}); this is a plain read-then-
+// write, not an atomic increment — fine for a single-user bot with no realistic
+// concurrent-intake race. Exactly one extra KV read + write per intake; no
+// per-video keys. Across a UTC day boundary the day string changes, so the new
+// day's counter is absent and naturally restarts at 0001. A short TTL lets stale
+// day-counters self-clean — the minted VID itself is permanent, stored on the item.
+async function nextVideoId(env) {
+  const day = new Date().toISOString().slice(0, 10).replace(/-/g, ""); // UTC YYYYMMDD
+  const counterKey = `vidCounter:${day}`;
+  const n = parseInt((await env.STATE.get(counterKey)) || "0", 10) + 1;
+  await env.STATE.put(counterKey, String(n), { expirationTtl: 60 * 60 * 48 });
+  return `VID-${day}-${String(n).padStart(4, "0")}`;
+}
+
 function dateKey(ms, timeZone) {
   return new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
 }
@@ -258,7 +275,9 @@ async function fetchWithRetry(url, retries = 2) {
 // bytes are downloaded from Telegram at upload time, never stored in KV.
 async function beginIntake(env, chatId, { fileId, fileUniqueId, caption, fileSize }) {
   const cleaned = cleanCaption(caption || "");
+  const vid = await nextVideoId(env);
   await logEvent(env, "VIDEO_RECEIVED", "Video received", {
+    vid,
     caption: cleaned ? cleaned.slice(0, 80) : undefined,
     chatId,
   });
@@ -267,6 +286,7 @@ async function beginIntake(env, chatId, { fileId, fileUniqueId, caption, fileSiz
       `pending:${chatId}`,
       JSON.stringify({
         step: "awaiting_title_confirmation",
+        vid,
         fileId,
         fileUniqueId,
         originalText: cleaned,
@@ -291,6 +311,7 @@ async function beginIntake(env, chatId, { fileId, fileUniqueId, caption, fileSiz
       `pending:${chatId}`,
       JSON.stringify({
         step: "awaiting_caption",
+        vid,
         fileId,
         fileUniqueId,
         fileSize: fileSize || 0,
@@ -316,7 +337,7 @@ async function fetchVideoBytes(env, item) {
   if (item.videoKey) {
     const bytes = await env.STATE.get(item.videoKey, "arrayBuffer");
     if (!bytes) throw new Error(`legacy videoKey ${item.videoKey} not found in KV`);
-    await logEvent(env, "SCHEMA_FALLBACK_USED", "Legacy videoKey fallback used", { title: item.title });
+    await logEvent(env, "SCHEMA_FALLBACK_USED", "Legacy videoKey fallback used", { vid: item.vid, title: item.title });
     return bytes;
   }
   throw new Error("queue item has neither fileId nor videoKey");
@@ -398,6 +419,22 @@ const EVENT_SEVERITY = {
 
 const isErrorishEvent = (ev) => EVENT_SEVERITY[ev.type] === "warning" || EVENT_SEVERITY[ev.type] === "error";
 
+// Best-known lifecycle status for a video, keyed by an event type. Used by
+// /history's no-arg index and each timeline's header to say where a video is.
+const VID_STATUS = {
+  VIDEO_RECEIVED: "received",
+  VIDEO_REJECTED: "rejected",
+  AI_STARTED: "processing",
+  AI_FAILED: "AI failed",
+  DRAFT_CREATED: "drafted",
+  QUEUE_ADDED: "queued",
+  QUEUE_REMOVED: "removed",
+  UPLOAD_STARTED: "uploading",
+  SCHEMA_FALLBACK_USED: "uploading",
+  UPLOAD_SUCCESS: "posted",
+  UPLOAD_FAILED: "upload failed",
+};
+
 // Turn an event's small meta into a short trailing detail, HTML-escaped since
 // the message is sent with HTML parse mode. Titles/captions are clipped.
 function eventDetail(ev) {
@@ -412,6 +449,13 @@ function eventDetail(ev) {
   return "";
 }
 
+// One rendered event line: "time icon message — detail". Shared by /logs and
+// /history so both use the exact same time/icon/detail convention.
+function formatEventLine(ev, timeZone) {
+  const icon = EVENT_ICONS[ev.type] || "•";
+  return `${escapeHtml(formatReadable(ev.timestamp, timeZone))} ${icon} ${escapeHtml(ev.message)}${eventDetail(ev)}`;
+}
+
 // Render one page of /logs, mirroring renderQueuePage exactly (same pagination
 // math, same button shape). `filter` is "errors" or "all"; the errors filter is
 // carried across pages via an ":e" segment on the lp: callback so paging stays
@@ -424,10 +468,7 @@ function renderLogsPage(env, entries, page, filter) {
   const filterSeg = filter === "errors" ? ":e" : "";
   const list = entries
     .slice(start, start + LOGS_PAGE_SIZE)
-    .map((ev) => {
-      const icon = EVENT_ICONS[ev.type] || "•";
-      return `${escapeHtml(formatReadable(ev.timestamp, timeZone))} ${icon} ${escapeHtml(ev.message)}${eventDetail(ev)}`;
-    })
+    .map((ev) => formatEventLine(ev, timeZone))
     .join("\n");
 
   const row = [];
@@ -439,6 +480,63 @@ function renderLogsPage(env, entries, page, filter) {
     : `🧾 ${entries.length} event(s) logged (page ${safePage}/${totalPages}):`;
   const text = `${header}\n\n${list}`;
   return { text, keyboard: { inline_keyboard: [row] } };
+}
+
+// Resolve a /history argument to a concrete VID. Accepts a full
+// "VID-YYYYMMDD-NNNN" (case-insensitive) returned as-is, or a bare numeric
+// suffix ("42", "0042") matched against the most recent VID in the log with
+// that sequence number. `log` is newest-first, so the first match is newest.
+// Returns null if a suffix query matches nothing.
+function resolveVid(log, arg) {
+  const raw = (arg || "").trim();
+  if (/^VID-\d{8}-\d{4}$/i.test(raw)) return raw.toUpperCase();
+  const digits = raw.replace(/\D/g, "");
+  if (!digits) return null;
+  const suffix = `-${digits.padStart(4, "0")}`;
+  for (const ev of log) {
+    const v = ev.meta && ev.meta.vid;
+    if (v && v.endsWith(suffix)) return v;
+  }
+  return null;
+}
+
+// Full chronological timeline for one VID (oldest-first — a timeline reads
+// better top-to-bottom in intake order, unlike newest-first /logs). Reuses the
+// same per-event line format as /logs. Returns null if no events match (aged
+// out of the capped log, or a typo'd ID). A YouTube link line is appended only
+// when an UPLOAD_SUCCESS event for this VID actually carries a videoId.
+function renderHistoryTimeline(env, log, vid) {
+  const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+  const events = log.filter((ev) => ev.meta && ev.meta.vid === vid).reverse();
+  if (events.length === 0) return null;
+  const latest = events[events.length - 1];
+  const status = VID_STATUS[latest.type] || "seen";
+  const lines = events.map((ev) => formatEventLine(ev, timeZone)).join("\n");
+  const success = events.find((ev) => ev.type === "UPLOAD_SUCCESS" && ev.meta && ev.meta.videoId);
+  const linkLine = success ? `\n\n🔗 https://youtu.be/${escapeHtml(success.meta.videoId)}` : "";
+  return `🎬 <b>${escapeHtml(vid)}</b> — ${escapeHtml(status)}\n\n${lines}${linkLine}`;
+}
+
+// No-argument /history: a lookup index of the most recent 10 distinct VIDs seen
+// in the event log, each with its current best-known status (inferred from that
+// VID's most recent event). Scans the already-fetched eventLog — no extra KV
+// key tracking "all VIDs". Returns null if the log has no VID-tagged events.
+function renderHistoryIndex(env, log) {
+  const timeZone = env.DISPLAY_TIMEZONE || "UTC";
+  const seen = new Map(); // vid -> its most recent event (log is newest-first)
+  for (const ev of log) {
+    const v = ev.meta && ev.meta.vid;
+    if (v && !seen.has(v)) seen.set(v, ev);
+    if (seen.size >= 10) break;
+  }
+  if (seen.size === 0) return null;
+  const lines = [];
+  for (const [vid, ev] of seen) {
+    const status = VID_STATUS[ev.type] || "seen";
+    const icon = EVENT_ICONS[ev.type] || "•";
+    lines.push(`${icon} <b>${escapeHtml(vid)}</b> — ${escapeHtml(status)} · ${escapeHtml(formatReadable(ev.timestamp, timeZone))}`);
+  }
+  return `🎬 <b>Recent videos</b> (last ${seen.size}):\n\n${lines.join("\n")}\n\nSend <code>/history &lt;id&gt;</code> for a full timeline (e.g. <code>/history ${escapeHtml([...seen.keys()][0].slice(-4))}</code>).`;
 }
 
 async function sendWeeklyDigest(env) {
@@ -568,7 +666,7 @@ async function processQueueTick(env) {
   }
 
   try {
-    await logEvent(env, "UPLOAD_STARTED", "Upload started", { title: item.title });
+    await logEvent(env, "UPLOAD_STARTED", "Upload started", { vid: item.vid, title: item.title });
     const videoId = await uploadShort(env, videoBytes, {
       title: item.title,
       description: item.description,
@@ -586,10 +684,10 @@ async function processQueueTick(env) {
 
     const postedRaw = await env.STATE.get("postedVideos");
     const posted = postedRaw ? JSON.parse(postedRaw) : [];
-    posted.unshift({ id: videoId, title: item.title, uploadedAt: Date.now() });
+    posted.unshift({ id: videoId, vid: item.vid, title: item.title, uploadedAt: Date.now() });
     await env.STATE.put("postedVideos", JSON.stringify(posted.slice(0, 200)));
 
-    await logEvent(env, "UPLOAD_SUCCESS", "Video uploaded to queue", { title: item.title, videoId });
+    await logEvent(env, "UPLOAD_SUCCESS", "Video uploaded to queue", { vid: item.vid, title: item.title, videoId });
     await tgSend(env, item.chatId, `✅ Queued video is live: https://youtu.be/${videoId}\n📋 ${queue.length} left in queue.`);
   } catch (err) {
     console.error("Queued upload failed:", err.message);
@@ -607,7 +705,7 @@ async function processQueueTick(env) {
     }
 
     item.failCount = (item.failCount || 0) + 1;
-    await logEvent(env, "UPLOAD_FAILED", "Upload failed", { title: item.title, error: err.message });
+    await logEvent(env, "UPLOAD_FAILED", "Upload failed", { vid: item.vid, title: item.title, error: err.message });
     if (item.failCount >= 2) {
       // Drop its slot and re-queue as an auto item so it gets the latest slot,
       // freeing the front for videos behind it instead of blocking them.
@@ -786,6 +884,27 @@ This bot only responds to your authorized Telegram accounts.
     return;
   }
 
+  if (message.text?.startsWith("/history")) {
+    const parts = message.text.trim().split(/\s+/);
+    const arg = parts[1];
+    const log = await getEventLog(env);
+
+    if (!arg) {
+      const text = renderHistoryIndex(env, log);
+      await tgSend(env, chatId, text || "🎬 No videos tracked yet. Send a video and it'll be assigned an ID like <b>VID-20260809-0001</b>.");
+      return;
+    }
+
+    const vid = resolveVid(log, arg);
+    const text = vid ? renderHistoryTimeline(env, log, vid) : null;
+    if (!text) {
+      await tgSend(env, chatId, `🔍 No history found for "<b>${escapeHtml(arg)}</b>". It might be a typo, or the video may be old enough to have aged out of the log. Send /history to see recent video IDs.`);
+      return;
+    }
+    await tgSend(env, chatId, text);
+    return;
+  }
+
   if (message.text?.startsWith("/setschedule")) {
     const parts = message.text.trim().split(/\s+/);
     const index = parseInt(parts[1], 10) - 1;
@@ -883,7 +1002,7 @@ This bot only responds to your authorized Telegram accounts.
     }
 
     try {
-      await logEvent(env, "UPLOAD_STARTED", "Upload started", { title: item.title });
+      await logEvent(env, "UPLOAD_STARTED", "Upload started", { vid: item.vid, title: item.title });
       const videoId = await uploadShort(env, videoBytes, {
         title: item.title,
         description: item.description,
@@ -905,10 +1024,10 @@ This bot only responds to your authorized Telegram accounts.
 
       const postedRaw = await env.STATE.get("postedVideos");
       const posted = postedRaw ? JSON.parse(postedRaw) : [];
-      posted.unshift({ id: videoId, title: item.title, uploadedAt: Date.now() });
+      posted.unshift({ id: videoId, vid: item.vid, title: item.title, uploadedAt: Date.now() });
       await env.STATE.put("postedVideos", JSON.stringify(posted.slice(0, 200)));
 
-      await logEvent(env, "UPLOAD_SUCCESS", "Video posted via /postnow", { title: item.title, videoId });
+      await logEvent(env, "UPLOAD_SUCCESS", "Video posted via /postnow", { vid: item.vid, title: item.title, videoId });
       await tgSend(env, chatId, `✅ Live now: https://youtu.be/${videoId}\n📋 ${queue.length} left in queue.`);
     } catch (err) {
       console.error("Manual /postnow upload failed:", err.message);
@@ -917,7 +1036,7 @@ This bot only responds to your authorized Telegram accounts.
       if (isQuotaError(err.message)) {
         await logEvent(env, "QUOTA_EXCEEDED", "YouTube daily quota exceeded", { title: item.title });
       } else {
-        await logEvent(env, "UPLOAD_FAILED", "Upload failed via /postnow", { title: item.title, error: err.message });
+        await logEvent(env, "UPLOAD_FAILED", "Upload failed via /postnow", { vid: item.vid, title: item.title, error: err.message });
       }
       await tgSend(env, chatId, `❌ Upload failed: ${err.message}\nIt's still in the queue — nothing was removed.`);
     }
@@ -937,7 +1056,7 @@ This bot only responds to your authorized Telegram accounts.
     const [removed] = queue.splice(index, 1);
     repackQueue(env, queue);
     await saveQueue(env, queue);
-    await logEvent(env, "QUEUE_REMOVED", "Video removed from queue", { title: removed.title });
+    await logEvent(env, "QUEUE_REMOVED", "Video removed from queue", { vid: removed.vid, title: removed.title });
 
     await tgSend(env, chatId, `🗑️ Removed "${escapeHtml(removed.title)}" from the queue. ${queue.length} left.`);
     return;
@@ -1085,6 +1204,7 @@ This bot only responds to your authorized Telegram accounts.
         `pending:${chatId}`,
         JSON.stringify({
           step: "awaiting_ai_choice",
+          vid: pending.vid,
           fileId: pending.fileId,
           fileUniqueId: pending.fileUniqueId,
           originalText: message.text.trim(),
@@ -1129,6 +1249,7 @@ This bot only responds to your authorized Telegram accounts.
         `pending:${chatId}`,
         JSON.stringify({
             step: "awaiting_ai_choice",
+            vid: pending.vid,
             fileId: pending.fileId,
             fileUniqueId: pending.fileUniqueId,
             originalText: pending.originalText,
@@ -1163,17 +1284,17 @@ Do you want AI to generate Title + Description + Hashtags?`,
 
 const cleanedInput = cleanCaption(message.text);
 
-await logEvent(env, "AI_STARTED", "AI metadata generation started");
+await logEvent(env, "AI_STARTED", "AI metadata generation started", { vid: pending.vid });
 let meta;
 try {
   meta = await generateMetadata(env, cleanedInput);
 } catch (err) {
-  await logEvent(env, "AI_FAILED", "AI metadata generation failed", { error: err.message });
+  await logEvent(env, "AI_FAILED", "AI metadata generation failed", { vid: pending.vid, error: err.message });
   throw err;
 }
 
-    await env.STATE.put(`draft:${chatId}`, JSON.stringify({ ...meta, originalText: cleanedInput, fileId: pending.fileId, fileUniqueId: pending.fileUniqueId, fileSize: pending.fileSize || 0 }));
-    await logEvent(env, "DRAFT_CREATED", "Draft created", { title: meta.title });
+    await env.STATE.put(`draft:${chatId}`, JSON.stringify({ ...meta, vid: pending.vid, originalText: cleanedInput, fileId: pending.fileId, fileUniqueId: pending.fileUniqueId, fileSize: pending.fileSize || 0 }));
+    await logEvent(env, "DRAFT_CREATED", "Draft created", { vid: pending.vid, title: meta.title });
     await env.STATE.put(`pending:${chatId}`, JSON.stringify({ step: "awaiting_confirmation" }));
 
     const hashtags = meta.hashtags.map((h) => `#${h.replace(/^#/, "")}`).join(" ");
@@ -1292,6 +1413,7 @@ async function handleCallback(cq, env) {
     `pending:${chatId}`,
     JSON.stringify({
       step: "awaiting_ai_choice",
+      vid: pending.vid,
       fileId: pending.fileId,
       fileUniqueId: pending.fileUniqueId,
       originalText: pending.originalText,
@@ -1335,6 +1457,7 @@ await env.STATE.put(
     `pending:${chatId}`,
     JSON.stringify({
         step: "editing_caption_title",
+        vid: pending.vid,
         fileId: pending.fileId,
         fileUniqueId: pending.fileUniqueId,
         originalText: pending.originalText,
@@ -1363,11 +1486,11 @@ if (cq.data === "generate_ai" || cq.data === "use_raw_title") {
   let meta;
 
   if (cq.data === "generate_ai") {
-    await logEvent(env, "AI_STARTED", "AI metadata generation started");
+    await logEvent(env, "AI_STARTED", "AI metadata generation started", { vid: pending.vid });
     try {
       meta = await generateMetadata(env, pending.originalText);
     } catch (err) {
-      await logEvent(env, "AI_FAILED", "AI metadata generation failed", { error: err.message });
+      await logEvent(env, "AI_FAILED", "AI metadata generation failed", { vid: pending.vid, error: err.message });
       throw err;
     }
   } else {
@@ -1382,13 +1505,14 @@ if (cq.data === "generate_ai" || cq.data === "use_raw_title") {
     `draft:${chatId}`,
     JSON.stringify({
       ...meta,
+      vid: pending.vid,
       originalText: pending.originalText,
       fileId: pending.fileId,
       fileUniqueId: pending.fileUniqueId,
       fileSize: pending.fileSize || 0,
     })
   );
-  await logEvent(env, "DRAFT_CREATED", "Draft created", { title: meta.title });
+  await logEvent(env, "DRAFT_CREATED", "Draft created", { vid: pending.vid, title: meta.title });
 
   await env.STATE.put(
     `pending:${chatId}`,
@@ -1459,11 +1583,11 @@ if (cq.data === "accept" || cq.data === "generate_ai") {
   await env.STATE.delete(`pending:${chatId}`);
 
   const queue = await getQueue(env);
-  const newItem = { id: queueId, fileId: draft.fileId, fileUniqueId: draft.fileUniqueId, title, description, hashtags: tags, chatId, fileSize: draft.fileSize || 0 };
+  const newItem = { id: queueId, vid: draft.vid, fileId: draft.fileId, fileUniqueId: draft.fileUniqueId, title, description, hashtags: tags, chatId, fileSize: draft.fileSize || 0 };
   queue.push(newItem);
   repackQueue(env, queue);
   await saveQueue(env, queue);
-  await logEvent(env, "QUEUE_ADDED", "Video added to queue", { title, scheduledAt: newItem.scheduledAt });
+  await logEvent(env, "QUEUE_ADDED", "Video added to queue", { vid: draft.vid, title, scheduledAt: newItem.scheduledAt });
 
   const position = queue.findIndex((q) => q.id === queueId) + 1;
   const timeZone = env.DISPLAY_TIMEZONE || "UTC";
