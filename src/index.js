@@ -823,6 +823,7 @@ Just send a video (under 20MB). I'll ask what it's about, generate a Persian tit
 /queue — see all queued videos with their scheduled date & time
 /postnow (position) — upload a specific queued video immediately, bypassing the schedule (e.g. /postnow 2)
 /setschedule (position) YYYY-MM-DD HH:MM — set a custom date/time for a queued video (e.g. /setschedule 2 2026-08-05 18:30). If it's too close to another upload, I'll adjust it automatically.
+/defaultschedule — clear all manual /setschedule pins and reset the whole queue back to the default auto-schedule, in original order.
 /remove (position) — delete one video from the queue (e.g. /remove 1)
 /clearqueue — wipe the entire queue
 /resumequeue — resume the queue after it's been auto-paused (e.g. YouTube quota exceeded)
@@ -854,6 +855,7 @@ This bot only responds to your authorized Telegram accounts.
       { command: "remove", description: "Delete one video from the queue" },
       { command: "postnow", description: "Upload a queued video immediately" },
       { command: "setschedule", description: "Set a custom date/time for a video" },
+      { command: "defaultschedule", description: "Reset all videos to the default auto-schedule" },
       { command: "resumequeue", description: "Resume queue after being paused" },
       { command: "clearqueue", description: "Wipe the entire queue" },
       { command: "help", description: "Show instructions" }
@@ -966,6 +968,36 @@ This bot only responds to your authorized Telegram accounts.
       env,
       chatId,
       `🗓️ Requested time for "${escapeHtml(item.title)}": ${formatReadable(targetMs, timeZone)}.${adjustedNote}\n\nSend /queue to see the full updated schedule.`
+    );
+    return;
+  }
+
+  if (message.text === "/defaultschedule") {
+    const queue = await getQueue(env);
+    if (queue.length === 0) {
+      await tgSend(env, chatId, "📭 Queue is empty — nothing to reset.");
+      return;
+    }
+
+    // Drop every manual pin (/setschedule override) and restore original
+    // intake order via the vid (VID-YYYYMMDD-NNNN sorts chronologically by
+    // when each video was received), then let repackQueue auto-slot everyone
+    // from scratch, exactly as if no /setschedule had ever been used.
+    let pinnedCount = 0;
+    for (const item of queue) {
+      if (item.manual) pinnedCount++;
+      delete item.manual;
+      delete item.manualScheduledAt;
+    }
+    queue.sort((a, b) => (a.vid || "").localeCompare(b.vid || ""));
+    repackQueue(env, queue);
+    await saveQueue(env, queue);
+
+    await logEvent(env, "SCHEDULE_RESET", "All videos reset to default auto-schedule", { pinnedCount, total: queue.length });
+    await tgSend(
+      env,
+      chatId,
+      `🔄 Reset ${queue.length} video(s) to the default auto-schedule${pinnedCount ? ` (cleared ${pinnedCount} manual pin${pinnedCount === 1 ? "" : "s"})` : ""}.\n\nSend /queue to see the updated schedule.`
     );
     return;
   }
